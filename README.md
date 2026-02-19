@@ -26,8 +26,8 @@ python .\export_entity_models.py
 ## Explicit Run
 ```powershell
 python .\export_entity_models.py `
-  --client-jar .\26.1-snapshot-7.jar `
-  --version-json .\26.1-snapshot-7.json `
+  --client-jar .\26.1-snapshot-9.jar `
+  --version-json .\26.1-snapshot-9.json `
   --output-dir .\exports
 ```
 
@@ -36,6 +36,7 @@ python .\export_entity_models.py `
 - `--no-lift-to-grid`: disables Y lift (default keeps lowest vertex at `Y=0`).
 - `--no-flip-v`: disables OBJ UV V flip.
 - `--flip-z`: mirrors Z axis.
+- `--no-split-cubes`: keeps old behavior (merges cubes under each model part).
 - `--scale <number>`: applies global scale.
 
 ## Output

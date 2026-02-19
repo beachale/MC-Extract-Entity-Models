@@ -274,6 +274,7 @@ def build_parser(default_output_dir: Path, default_libraries_dir: Path) -> argpa
     parser.add_argument("--no-lift-to-grid", action="store_true", help="Disable Y-lift to grid (minY=0).")
     parser.add_argument("--no-flip-v", action="store_true", help="Disable V flip for OBJ UVs.")
     parser.add_argument("--flip-z", action="store_true", help="Mirror Z axis.")
+    parser.add_argument("--no-split-cubes", action="store_true", help="Merge cubes per model part instead of splitting per cube.")
     parser.add_argument("--scale", type=float, default=1.0, help="Global scale multiplier.")
 
     return parser
@@ -374,6 +375,8 @@ def main() -> int:
         "false" if args.no_flip_v else "true",
         "--flip-z",
         "true" if args.flip_z else "false",
+        "--split-cubes",
+        "false" if args.no_split_cubes else "true",
         "--scale",
         f"{args.scale:.8g}",
     ]

@@ -7,6 +7,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -39,12 +40,9 @@ public final class EntityLayerObjExporter {
 
         ReflectionContext ctx = new ReflectionContext();
 
-        ctx.sharedConstantsTryDetectVersionMethod.invoke(null);
-        ctx.bootstrapMethod.invoke(null);
-
-        Object entityModelSet = ctx.entityModelSetVanillaMethod.invoke(null);
-        @SuppressWarnings("unchecked")
-        Map<Object, Object> roots = (Map<Object, Object>) ctx.layerDefinitionsCreateRootsMethod.invoke(null);
+        ctx.initializeGameData();
+        Map<Object, Object> roots = ctx.createRoots();
+        Object entityModelSet = ctx.createEntityModelSet(roots);
 
         List<Object> locations = new ArrayList<Object>(roots.keySet());
         locations.sort(new Comparator<Object>() {
@@ -82,7 +80,7 @@ public final class EntityLayerObjExporter {
                     String textureSource = texture != null ? texture.sourceEntry : null;
 
                     try (ObjWriter writer = new ObjWriter(objPath, mtlPath, location.toString(), textureMapPath, textureSource)) {
-                        Object rootPart = ctx.entityModelSetBakeLayerMethod.invoke(entityModelSet, location);
+                        Object rootPart = ctx.bakeLayer(entityModelSet, location);
                         exportModel(ctx, rootPart, writer, config);
                     }
                     if (config.liftToGrid) {
@@ -119,21 +117,61 @@ public final class EntityLayerObjExporter {
     private static void exportModel(final ReflectionContext ctx, Object rootPart, final ObjWriter writer, final Config config)
             throws Exception {
         final Object poseStack = ctx.poseStackCtor.newInstance();
+        final Map<String, Integer> cubeCountersByPart = new HashMap<String, Integer>();
 
         InvocationHandler handler = new InvocationHandler() {
             @Override
             public Object invoke(Object proxy, Method method, Object[] arguments) throws Throwable {
-                if (!"visit".equals(method.getName()) || arguments == null || arguments.length != 4) {
-                    return null;
+                if (arguments == null || arguments.length == 0) {
+                    return defaultReturnValue(method.getReturnType());
                 }
 
-                Object pose = arguments[0];
-                String path = (String) arguments[1];
-                Object cube = arguments[3];
+                Object pose = null;
+                String path = null;
+                Object cube = null;
+                Integer cubeIndex = null;
+                for (Object argument : arguments) {
+                    if (argument == null) {
+                        continue;
+                    }
+                    if (pose == null && ctx.poseClass.isInstance(argument)) {
+                        pose = argument;
+                    }
+                    if (path == null && argument instanceof String) {
+                        path = (String) argument;
+                    }
+                    if (cube == null && ctx.cubeClass.isInstance(argument)) {
+                        cube = argument;
+                    }
+                    if (cubeIndex == null && isIntegralNumber(argument)) {
+                        cubeIndex = Integer.valueOf(((Number) argument).intValue());
+                    }
+                }
 
-                writer.beginPart(sanitizeObjName(normalizePartPath(path)));
+                if (cube == null) {
+                    return defaultReturnValue(method.getReturnType());
+                }
+                if (pose == null) {
+                    return defaultReturnValue(method.getReturnType());
+                }
+
+                String normalizedPath = normalizePartPath(path);
+                String partPath = normalizedPath;
+                if (config.splitCubes) {
+                    int resolvedIndex;
+                    if (cubeIndex != null && cubeIndex.intValue() >= 0) {
+                        resolvedIndex = cubeIndex.intValue();
+                    } else {
+                        Integer next = cubeCountersByPart.get(normalizedPath);
+                        resolvedIndex = next != null ? next.intValue() : 0;
+                        cubeCountersByPart.put(normalizedPath, Integer.valueOf(resolvedIndex + 1));
+                    }
+                    partPath = String.format(Locale.ROOT, "%s.cube_%03d", normalizedPath, Integer.valueOf(resolvedIndex));
+                }
+
+                writer.beginPart(sanitizeObjName(partPath));
                 exportCube(ctx, pose, cube, writer, config);
-                return null;
+                return defaultReturnValue(method.getReturnType());
             }
         };
 
@@ -149,45 +187,37 @@ public final class EntityLayerObjExporter {
     private static void exportCube(ReflectionContext ctx, Object pose, Object cube, ObjWriter writer, Config config)
             throws Exception {
         Object matrix = ctx.posePoseMethod.invoke(pose);
-        Object[] polygons = (Object[]) ctx.cubePolygonsField.get(cube);
+        Object[] polygons = ctx.getCubePolygons(cube);
         float signX = config.applyRuntimeOrientation ? -1.0f : 1.0f;
         float signY = config.applyRuntimeOrientation ? -1.0f : 1.0f;
         float signZ = config.flipZ ? -1.0f : 1.0f;
         boolean reverseWinding = signX * signY * signZ < 0.0f;
 
         for (Object polygon : polygons) {
-            Object normal = ctx.polygonNormalMethod.invoke(polygon);
-            Object tempNormal = ctx.vector3fCtor.newInstance();
-            Object transformedNormal = ctx.poseTransformNormalMethod.invoke(pose, normal, tempNormal);
+            Object normal = ctx.getPolygonNormal(polygon);
+            Object transformedNormal = ctx.transformNormal(pose, normal);
 
-            float normalX = invokeFloat(ctx.vector3fXMethod, transformedNormal) * signX;
-            float normalY = invokeFloat(ctx.vector3fYMethod, transformedNormal) * signY;
-            float normalZ = invokeFloat(ctx.vector3fZMethod, transformedNormal) * signZ;
+            float normalX = ctx.getVectorX(transformedNormal) * signX;
+            float normalY = ctx.getVectorY(transformedNormal) * signY;
+            float normalZ = ctx.getVectorZ(transformedNormal) * signZ;
             int normalIndex = writer.writeNormal(normalX, normalY, normalZ);
 
-            Object[] vertices = (Object[]) ctx.polygonVerticesMethod.invoke(polygon);
+            Object[] vertices = ctx.getPolygonVertices(polygon);
             int[] vertexIndices = new int[vertices.length];
             int[] uvIndices = new int[vertices.length];
 
             for (int i = 0; i < vertices.length; i++) {
                 Object vertex = vertices[i];
 
-                float worldX = invokeFloat(ctx.vertexWorldXMethod, vertex);
-                float worldY = invokeFloat(ctx.vertexWorldYMethod, vertex);
-                float worldZ = invokeFloat(ctx.vertexWorldZMethod, vertex);
+                float worldX = ctx.getVertexWorldX(vertex);
+                float worldY = ctx.getVertexWorldY(vertex);
+                float worldZ = ctx.getVertexWorldZ(vertex);
 
-                Object tempPosition = ctx.vector3fCtor.newInstance();
-                Object transformedPosition = ctx.matrixTransformPositionMethod.invoke(
-                    matrix,
-                    Float.valueOf(worldX),
-                    Float.valueOf(worldY),
-                    Float.valueOf(worldZ),
-                    tempPosition
-                );
+                Object transformedPosition = ctx.transformPosition(matrix, worldX, worldY, worldZ);
 
-                float x = invokeFloat(ctx.vector3fXMethod, transformedPosition);
-                float y = invokeFloat(ctx.vector3fYMethod, transformedPosition);
-                float z = invokeFloat(ctx.vector3fZMethod, transformedPosition);
+                float x = ctx.getVectorX(transformedPosition);
+                float y = ctx.getVectorY(transformedPosition);
+                float z = ctx.getVectorZ(transformedPosition);
 
                 x *= signX;
                 y *= signY;
@@ -195,8 +225,8 @@ public final class EntityLayerObjExporter {
 
                 vertexIndices[i] = writer.writeVertex(x * config.scale, y * config.scale, z * config.scale);
 
-                float u = invokeFloat(ctx.vertexUMethod, vertex);
-                float v = invokeFloat(ctx.vertexVMethod, vertex);
+                float u = ctx.getVertexU(vertex);
+                float v = ctx.getVertexV(vertex);
                 if (config.flipV) {
                     v = 1.0f - v;
                 }
@@ -208,9 +238,39 @@ public final class EntityLayerObjExporter {
         }
     }
 
-    private static float invokeFloat(Method method, Object target)
-            throws IllegalAccessException, InvocationTargetException {
-        return ((Float) method.invoke(target)).floatValue();
+    private static Object defaultReturnValue(Class<?> type) {
+        if (type == null || type == Void.TYPE) {
+            return null;
+        }
+        if (type == Boolean.TYPE) {
+            return Boolean.FALSE;
+        }
+        if (type == Byte.TYPE) {
+            return Byte.valueOf((byte) 0);
+        }
+        if (type == Short.TYPE) {
+            return Short.valueOf((short) 0);
+        }
+        if (type == Integer.TYPE) {
+            return Integer.valueOf(0);
+        }
+        if (type == Long.TYPE) {
+            return Long.valueOf(0L);
+        }
+        if (type == Float.TYPE) {
+            return Float.valueOf(0.0f);
+        }
+        if (type == Double.TYPE) {
+            return Double.valueOf(0.0d);
+        }
+        if (type == Character.TYPE) {
+            return Character.valueOf('\0');
+        }
+        return null;
+    }
+
+    private static boolean isIntegralNumber(Object value) {
+        return value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long;
     }
 
     private static String normalizePartPath(String rawPath) {
@@ -235,10 +295,10 @@ public final class EntityLayerObjExporter {
     }
 
     private static LocationInfo describeLocation(ReflectionContext ctx, Object location)
-            throws IllegalAccessException, InvocationTargetException {
-        Object modelId = ctx.modelLayerLocationModelMethod.invoke(location);
+            throws Exception {
+        Object modelId = ctx.getLocationModel(location);
         String modelString = String.valueOf(modelId);
-        String layer = String.valueOf(ctx.modelLayerLocationLayerMethod.invoke(location));
+        String layer = String.valueOf(ctx.getLocationLayer(location));
 
         String namespace = "minecraft";
         String modelPath = modelString;
@@ -330,15 +390,26 @@ public final class EntityLayerObjExporter {
         final boolean liftToGrid;
         final boolean flipV;
         final boolean flipZ;
+        final boolean splitCubes;
         final float scale;
 
-        Config(Path outputDir, Path clientJarPath, boolean applyRuntimeOrientation, boolean liftToGrid, boolean flipV, boolean flipZ, float scale) {
+        Config(
+            Path outputDir,
+            Path clientJarPath,
+            boolean applyRuntimeOrientation,
+            boolean liftToGrid,
+            boolean flipV,
+            boolean flipZ,
+            boolean splitCubes,
+            float scale
+        ) {
             this.outputDir = outputDir;
             this.clientJarPath = clientJarPath;
             this.applyRuntimeOrientation = applyRuntimeOrientation;
             this.liftToGrid = liftToGrid;
             this.flipV = flipV;
             this.flipZ = flipZ;
+            this.splitCubes = splitCubes;
             this.scale = scale;
         }
 
@@ -353,6 +424,7 @@ public final class EntityLayerObjExporter {
             boolean liftToGrid = true;
             boolean flipV = true;
             boolean flipZ = false;
+            boolean splitCubes = true;
             float scale = 1.0f;
 
             for (int i = 0; i < args.length; i++) {
@@ -371,6 +443,8 @@ public final class EntityLayerObjExporter {
                     flipV = parseBoolean(requireValue(args, ++i, "--flip-v"));
                 } else if ("--flip-z".equals(arg)) {
                     flipZ = parseBoolean(requireValue(args, ++i, "--flip-z"));
+                } else if ("--split-cubes".equals(arg)) {
+                    splitCubes = parseBoolean(requireValue(args, ++i, "--split-cubes"));
                 } else if ("--scale".equals(arg)) {
                     scale = Float.parseFloat(requireValue(args, ++i, "--scale"));
                 } else {
@@ -386,7 +460,7 @@ public final class EntityLayerObjExporter {
                 throw new IllegalArgumentException("Client jar not found: " + clientJarPath.toAbsolutePath());
             }
 
-            return new Config(outputDir, clientJarPath, applyRuntimeOrientation, liftToGrid, flipV, flipZ, scale);
+            return new Config(outputDir, clientJarPath, applyRuntimeOrientation, liftToGrid, flipV, flipZ, splitCubes, scale);
         }
 
         private static String requireValue(String[] args, int index, String flag) {
@@ -408,7 +482,7 @@ public final class EntityLayerObjExporter {
 
         private static void printUsageAndExit(int code) {
             System.out.println("Usage:");
-            System.out.println("  java EntityLayerObjExporter --out <outputDir> [--client-jar <clientJar>] [--runtime-orientation true|false] [--lift-to-grid true|false] [--flip-v true|false] [--flip-z true|false] [--scale <float>]");
+            System.out.println("  java EntityLayerObjExporter --out <outputDir> [--client-jar <clientJar>] [--runtime-orientation true|false] [--lift-to-grid true|false] [--flip-v true|false] [--flip-z true|false] [--split-cubes true|false] [--scale <float>]");
             System.exit(code);
         }
     }
@@ -799,10 +873,13 @@ public final class EntityLayerObjExporter {
     }
 
     private static final class ReflectionContext {
+        final Class<?> poseClass;
+        final Class<?> cubeClass;
         final Class<?> modelPartVisitorClass;
 
         final Constructor<?> poseStackCtor;
         final Constructor<?> vector3fCtor;
+        final Constructor<?> entityModelSetMapCtor;
 
         final Method entityModelSetVanillaMethod;
         final Method entityModelSetBakeLayerMethod;
@@ -816,21 +893,34 @@ public final class EntityLayerObjExporter {
         final Method matrixTransformPositionMethod;
 
         final Method polygonVerticesMethod;
+        final Field polygonVerticesField;
         final Method polygonNormalMethod;
+        final Field polygonNormalField;
 
         final Method vertexWorldXMethod;
+        final Field vertexWorldXField;
         final Method vertexWorldYMethod;
+        final Field vertexWorldYField;
         final Method vertexWorldZMethod;
+        final Field vertexWorldZField;
         final Method vertexUMethod;
+        final Field vertexUField;
         final Method vertexVMethod;
+        final Field vertexVField;
 
         final Method vector3fXMethod;
+        final Field vector3fXField;
         final Method vector3fYMethod;
+        final Field vector3fYField;
         final Method vector3fZMethod;
+        final Field vector3fZField;
 
         final Method modelLayerLocationModelMethod;
+        final Field modelLayerLocationModelField;
         final Method modelLayerLocationLayerMethod;
+        final Field modelLayerLocationLayerField;
 
+        final Method cubePolygonsMethod;
         final Field cubePolygonsField;
 
         ReflectionContext() throws Exception {
@@ -849,45 +939,605 @@ public final class EntityLayerObjExporter {
             Class<?> polygonClass = Class.forName("net.minecraft.client.model.geom.ModelPart$Polygon");
             Class<?> vertexClass = Class.forName("net.minecraft.client.model.geom.ModelPart$Vertex");
 
+            this.poseClass = poseClass;
+            this.cubeClass = cubeClass;
             this.modelPartVisitorClass = Class.forName("net.minecraft.client.model.geom.ModelPart$Visitor");
 
-            this.poseStackCtor = poseStackClass.getConstructor();
-            this.vector3fCtor = vector3fClass.getConstructor();
+            this.poseStackCtor = requireNoArgConstructor(poseStackClass);
+            this.vector3fCtor = requireNoArgConstructor(vector3fClass);
+            this.entityModelSetMapCtor = findSingleArgConstructor(entityModelSetClass, Map.class);
 
-            this.entityModelSetVanillaMethod = entityModelSetClass.getMethod("vanilla");
-            this.entityModelSetBakeLayerMethod = entityModelSetClass.getMethod("bakeLayer", modelLayerLocationClass);
-            this.layerDefinitionsCreateRootsMethod = layerDefinitionsClass.getMethod("createRoots");
-            this.sharedConstantsTryDetectVersionMethod = sharedConstantsClass.getMethod("tryDetectVersion");
-            this.bootstrapMethod = bootstrapClass.getMethod("bootStrap");
+            Method vanilla = findNoArgMethod(entityModelSetClass, true, "vanilla", "createVanilla");
+            if (vanilla == null) {
+                vanilla = findStaticFactoryMethod(entityModelSetClass);
+            }
+            this.entityModelSetVanillaMethod = vanilla;
 
-            this.modelPartVisitMethod = modelPartClass.getMethod("visit", poseStackClass, this.modelPartVisitorClass);
-            this.posePoseMethod = poseClass.getMethod("pose");
-            this.poseTransformNormalMethod = poseClass.getMethod("transformNormal", vector3fcClass, vector3fClass);
-            this.matrixTransformPositionMethod = matrix4fClass.getMethod(
+            this.entityModelSetBakeLayerMethod = requireMethodWithSingleParam(
+                entityModelSetClass,
+                false,
+                modelLayerLocationClass,
+                modelPartClass,
+                "bakeLayer"
+            );
+
+            Method createRoots = findNoArgMethod(layerDefinitionsClass, true, "createRoots");
+            if (createRoots == null) {
+                createRoots = findNoArgMapMethod(layerDefinitionsClass, true);
+            }
+            if (createRoots == null) {
+                throw new NoSuchMethodException("LayerDefinitions#createRoots compatible method was not found.");
+            }
+            this.layerDefinitionsCreateRootsMethod = createRoots;
+
+            this.sharedConstantsTryDetectVersionMethod = findNoArgMethod(sharedConstantsClass, true, "tryDetectVersion", "detectVersion");
+            Method bootstrap = findNoArgMethod(bootstrapClass, true, "bootStrap", "bootstrap");
+            if (bootstrap == null) {
+                bootstrap = findMethodWithArity(bootstrapClass, true, 1, "bootStrap", "bootstrap");
+            }
+            this.bootstrapMethod = bootstrap;
+
+            Method visit = findExactMethod(modelPartClass, "visit", poseStackClass, this.modelPartVisitorClass);
+            if (visit == null) {
+                visit = findMethodWithArity(modelPartClass, false, 2, "visit");
+            }
+            if (visit == null) {
+                throw new NoSuchMethodException("ModelPart#visit compatible method was not found.");
+            }
+            this.modelPartVisitMethod = visit;
+
+            this.posePoseMethod = requireNoArgMethod(poseClass, false, "pose", "positionMatrix");
+
+            Method transformNormal = findExactMethod(poseClass, "transformNormal", vector3fcClass, vector3fClass);
+            if (transformNormal == null) {
+                transformNormal = findExactMethod(poseClass, "transformNormal", vector3fcClass);
+            }
+            if (transformNormal == null) {
+                transformNormal = findMethodWithArity(poseClass, false, 2, "transformNormal");
+            }
+            if (transformNormal == null) {
+                transformNormal = findMethodWithArity(poseClass, false, 1, "transformNormal");
+            }
+            this.poseTransformNormalMethod = transformNormal;
+
+            Method transformPosition = findExactMethod(
+                matrix4fClass,
                 "transformPosition",
                 Float.TYPE,
                 Float.TYPE,
                 Float.TYPE,
                 vector3fClass
             );
+            if (transformPosition == null) {
+                transformPosition = findExactMethod(
+                    matrix4fClass,
+                    "transformPosition",
+                    Float.TYPE,
+                    Float.TYPE,
+                    Float.TYPE
+                );
+            }
+            if (transformPosition == null) {
+                transformPosition = findMethodWithArity(matrix4fClass, false, 4, "transformPosition");
+            }
+            if (transformPosition == null) {
+                transformPosition = findMethodWithArity(matrix4fClass, false, 3, "transformPosition");
+            }
+            if (transformPosition == null) {
+                throw new NoSuchMethodException("Matrix4f#transformPosition compatible method was not found.");
+            }
+            this.matrixTransformPositionMethod = transformPosition;
 
-            this.polygonVerticesMethod = polygonClass.getMethod("vertices");
-            this.polygonNormalMethod = polygonClass.getMethod("normal");
+            this.polygonVerticesMethod = findNoArgMethod(polygonClass, false, "vertices", "getVertices");
+            this.polygonVerticesField = findField(polygonClass, "vertices", "vertexes");
 
-            this.vertexWorldXMethod = vertexClass.getMethod("worldX");
-            this.vertexWorldYMethod = vertexClass.getMethod("worldY");
-            this.vertexWorldZMethod = vertexClass.getMethod("worldZ");
-            this.vertexUMethod = vertexClass.getMethod("u");
-            this.vertexVMethod = vertexClass.getMethod("v");
+            this.polygonNormalMethod = findNoArgMethod(polygonClass, false, "normal", "getNormal");
+            this.polygonNormalField = findField(polygonClass, "normal");
 
-            this.vector3fXMethod = vector3fClass.getMethod("x");
-            this.vector3fYMethod = vector3fClass.getMethod("y");
-            this.vector3fZMethod = vector3fClass.getMethod("z");
+            this.vertexWorldXMethod = findFloatGetter(vertexClass, "worldX", "x", "getX");
+            this.vertexWorldXField = findFloatField(vertexClass, "worldX", "x");
+            this.vertexWorldYMethod = findFloatGetter(vertexClass, "worldY", "y", "getY");
+            this.vertexWorldYField = findFloatField(vertexClass, "worldY", "y");
+            this.vertexWorldZMethod = findFloatGetter(vertexClass, "worldZ", "z", "getZ");
+            this.vertexWorldZField = findFloatField(vertexClass, "worldZ", "z");
+            this.vertexUMethod = findFloatGetter(vertexClass, "u", "getU");
+            this.vertexUField = findFloatField(vertexClass, "u");
+            this.vertexVMethod = findFloatGetter(vertexClass, "v", "getV");
+            this.vertexVField = findFloatField(vertexClass, "v");
 
-            this.modelLayerLocationModelMethod = modelLayerLocationClass.getMethod("model");
-            this.modelLayerLocationLayerMethod = modelLayerLocationClass.getMethod("layer");
+            this.vector3fXMethod = findFloatGetter(vector3fClass, "x", "getX");
+            this.vector3fXField = findFloatField(vector3fClass, "x");
+            this.vector3fYMethod = findFloatGetter(vector3fClass, "y", "getY");
+            this.vector3fYField = findFloatField(vector3fClass, "y");
+            this.vector3fZMethod = findFloatGetter(vector3fClass, "z", "getZ");
+            this.vector3fZField = findFloatField(vector3fClass, "z");
 
-            this.cubePolygonsField = cubeClass.getField("polygons");
+            this.modelLayerLocationModelMethod = findNoArgMethod(modelLayerLocationClass, false, "model", "id", "getModel");
+            this.modelLayerLocationModelField = findField(modelLayerLocationClass, "model", "id");
+            this.modelLayerLocationLayerMethod = findNoArgMethod(modelLayerLocationClass, false, "layer", "getLayer");
+            this.modelLayerLocationLayerField = findField(modelLayerLocationClass, "layer");
+
+            this.cubePolygonsMethod = findNoArgMethod(cubeClass, false, "polygons", "getPolygons");
+            this.cubePolygonsField = findField(cubeClass, "polygons");
+
+            if (this.entityModelSetVanillaMethod == null && this.entityModelSetMapCtor == null) {
+                throw new NoSuchMethodException("No compatible EntityModelSet initializer found.");
+            }
+            if (this.polygonVerticesMethod == null && this.polygonVerticesField == null) {
+                throw new NoSuchMethodException("ModelPart$Polygon vertices accessor was not found.");
+            }
+            if (this.polygonNormalMethod == null && this.polygonNormalField == null) {
+                throw new NoSuchMethodException("ModelPart$Polygon normal accessor was not found.");
+            }
+            if (this.cubePolygonsMethod == null && this.cubePolygonsField == null) {
+                throw new NoSuchMethodException("ModelPart$Cube polygons accessor was not found.");
+            }
+        }
+
+        void initializeGameData() throws Exception {
+            invokeStaticOptional(this.sharedConstantsTryDetectVersionMethod);
+            invokeStaticOptional(this.bootstrapMethod);
+        }
+
+        @SuppressWarnings("unchecked")
+        Map<Object, Object> createRoots() throws Exception {
+            Object value = invokeWithDefaults(this.layerDefinitionsCreateRootsMethod, null);
+            if (!(value instanceof Map)) {
+                throw new IllegalStateException("LayerDefinitions#createRoots returned non-map value: " + value);
+            }
+            return (Map<Object, Object>) value;
+        }
+
+        Object createEntityModelSet(Map<Object, Object> roots) throws Exception {
+            if (this.entityModelSetVanillaMethod != null) {
+                try {
+                    Object value = invokeWithDefaults(this.entityModelSetVanillaMethod, null);
+                    if (value != null) {
+                        return value;
+                    }
+                } catch (InvocationTargetException ignored) {
+                    if (this.entityModelSetMapCtor == null) {
+                        throw ignored;
+                    }
+                }
+            }
+
+            if (this.entityModelSetMapCtor != null) {
+                return this.entityModelSetMapCtor.newInstance(roots);
+            }
+
+            throw new IllegalStateException("No EntityModelSet creation strategy is available.");
+        }
+
+        Object bakeLayer(Object entityModelSet, Object location) throws Exception {
+            return this.entityModelSetBakeLayerMethod.invoke(entityModelSet, location);
+        }
+
+        Object[] getCubePolygons(Object cube) throws Exception {
+            Object raw = this.cubePolygonsMethod != null ? this.cubePolygonsMethod.invoke(cube) : this.cubePolygonsField.get(cube);
+            return asObjectArray(raw, "cube polygons");
+        }
+
+        Object[] getPolygonVertices(Object polygon) throws Exception {
+            Object raw = this.polygonVerticesMethod != null ? this.polygonVerticesMethod.invoke(polygon) : this.polygonVerticesField.get(polygon);
+            return asObjectArray(raw, "polygon vertices");
+        }
+
+        Object getPolygonNormal(Object polygon) throws Exception {
+            if (this.polygonNormalMethod != null) {
+                return this.polygonNormalMethod.invoke(polygon);
+            }
+            return this.polygonNormalField.get(polygon);
+        }
+
+        Object transformNormal(Object pose, Object normal) throws Exception {
+            if (this.poseTransformNormalMethod == null) {
+                return normal;
+            }
+
+            int params = this.poseTransformNormalMethod.getParameterCount();
+            if (params == 2) {
+                Object temp = this.vector3fCtor.newInstance();
+                Object out = this.poseTransformNormalMethod.invoke(pose, normal, temp);
+                return out != null ? out : temp;
+            }
+            if (params == 1) {
+                Object out = this.poseTransformNormalMethod.invoke(pose, normal);
+                return out != null ? out : normal;
+            }
+
+            Object out = invokeWithDefaults(this.poseTransformNormalMethod, pose);
+            return out != null ? out : normal;
+        }
+
+        Object transformPosition(Object matrix, float x, float y, float z) throws Exception {
+            int params = this.matrixTransformPositionMethod.getParameterCount();
+            if (params == 4) {
+                Object temp = this.vector3fCtor.newInstance();
+                Object out = this.matrixTransformPositionMethod.invoke(
+                    matrix,
+                    Float.valueOf(x),
+                    Float.valueOf(y),
+                    Float.valueOf(z),
+                    temp
+                );
+                return out != null ? out : temp;
+            }
+            if (params == 3) {
+                return this.matrixTransformPositionMethod.invoke(
+                    matrix,
+                    Float.valueOf(x),
+                    Float.valueOf(y),
+                    Float.valueOf(z)
+                );
+            }
+            return invokeWithDefaults(this.matrixTransformPositionMethod, matrix);
+        }
+
+        float getVertexWorldX(Object vertex) throws Exception {
+            return readFloat(vertex, this.vertexWorldXMethod, this.vertexWorldXField, "vertex worldX", "worldX", "x", "getX");
+        }
+
+        float getVertexWorldY(Object vertex) throws Exception {
+            return readFloat(vertex, this.vertexWorldYMethod, this.vertexWorldYField, "vertex worldY", "worldY", "y", "getY");
+        }
+
+        float getVertexWorldZ(Object vertex) throws Exception {
+            return readFloat(vertex, this.vertexWorldZMethod, this.vertexWorldZField, "vertex worldZ", "worldZ", "z", "getZ");
+        }
+
+        float getVertexU(Object vertex) throws Exception {
+            return readFloat(vertex, this.vertexUMethod, this.vertexUField, "vertex U", "u", "getU");
+        }
+
+        float getVertexV(Object vertex) throws Exception {
+            return readFloat(vertex, this.vertexVMethod, this.vertexVField, "vertex V", "v", "getV");
+        }
+
+        float getVectorX(Object vector) throws Exception {
+            return readFloat(vector, this.vector3fXMethod, this.vector3fXField, "vector X", "x", "getX");
+        }
+
+        float getVectorY(Object vector) throws Exception {
+            return readFloat(vector, this.vector3fYMethod, this.vector3fYField, "vector Y", "y", "getY");
+        }
+
+        float getVectorZ(Object vector) throws Exception {
+            return readFloat(vector, this.vector3fZMethod, this.vector3fZField, "vector Z", "z", "getZ");
+        }
+
+        Object getLocationModel(Object location) throws Exception {
+            return readObject(location, this.modelLayerLocationModelMethod, this.modelLayerLocationModelField, "location model", "model", "id", "getModel");
+        }
+
+        Object getLocationLayer(Object location) throws Exception {
+            return readObject(location, this.modelLayerLocationLayerMethod, this.modelLayerLocationLayerField, "location layer", "layer", "getLayer");
+        }
+
+        private static Object[] asObjectArray(Object value, String label) {
+            if (value == null) {
+                return new Object[0];
+            }
+            if (value instanceof Object[]) {
+                return (Object[]) value;
+            }
+            if (value instanceof List) {
+                return ((List<?>) value).toArray();
+            }
+            throw new IllegalStateException("Unsupported " + label + " container type: " + value.getClass().getName());
+        }
+
+        private static void invokeStaticOptional(Method method) throws Exception {
+            if (method != null) {
+                invokeWithDefaults(method, null);
+            }
+        }
+
+        private static Object invokeWithDefaults(Method method, Object target) throws Exception {
+            Class<?>[] parameterTypes = method.getParameterTypes();
+            Object[] arguments = new Object[parameterTypes.length];
+            for (int i = 0; i < parameterTypes.length; i++) {
+                arguments[i] = defaultReturnValue(parameterTypes[i]);
+            }
+            return method.invoke(target, arguments);
+        }
+
+        private static float readFloat(Object target, Method method, Field field, String label, String... dynamicNames) throws Exception {
+            Object value;
+            if (method != null) {
+                value = method.invoke(target);
+                return asFloat(value, label);
+            }
+            if (field != null) {
+                value = field.get(target);
+                return asFloat(value, label);
+            }
+
+            Method dynamicMethod = findFloatGetter(target.getClass(), dynamicNames);
+            if (dynamicMethod != null) {
+                return asFloat(dynamicMethod.invoke(target), label);
+            }
+            Field dynamicField = findFloatField(target.getClass(), dynamicNames);
+            if (dynamicField != null) {
+                return asFloat(dynamicField.get(target), label);
+            }
+
+            throw new NoSuchMethodException("No numeric accessor found for " + label + ".");
+        }
+
+        private static Object readObject(Object target, Method method, Field field, String label, String... dynamicNames) throws Exception {
+            if (method != null) {
+                return method.invoke(target);
+            }
+            if (field != null) {
+                return field.get(target);
+            }
+
+            Method dynamicMethod = findNoArgMethod(target.getClass(), false, dynamicNames);
+            if (dynamicMethod != null) {
+                return dynamicMethod.invoke(target);
+            }
+            Field dynamicField = findField(target.getClass(), dynamicNames);
+            if (dynamicField != null) {
+                return dynamicField.get(target);
+            }
+
+            throw new NoSuchMethodException("No accessor found for " + label + ".");
+        }
+
+        private static float asFloat(Object value, String label) {
+            if (value instanceof Number) {
+                return ((Number) value).floatValue();
+            }
+            throw new IllegalStateException("Expected numeric value for " + label + " but got: " + value);
+        }
+
+        private static Constructor<?> requireNoArgConstructor(Class<?> owner) throws NoSuchMethodException {
+            try {
+                Constructor<?> constructor = owner.getConstructor();
+                makeAccessible(constructor);
+                return constructor;
+            } catch (NoSuchMethodException ignored) {
+            }
+            Constructor<?> constructor = owner.getDeclaredConstructor();
+            makeAccessible(constructor);
+            return constructor;
+        }
+
+        private static Constructor<?> findSingleArgConstructor(Class<?> owner, Class<?> parameterSuperType) {
+            for (Constructor<?> constructor : owner.getConstructors()) {
+                if (constructor.getParameterCount() != 1) {
+                    continue;
+                }
+                Class<?> argType = constructor.getParameterTypes()[0];
+                if (argType.isAssignableFrom(parameterSuperType) || parameterSuperType.isAssignableFrom(argType)) {
+                    makeAccessible(constructor);
+                    return constructor;
+                }
+            }
+            for (Constructor<?> constructor : owner.getDeclaredConstructors()) {
+                if (constructor.getParameterCount() != 1) {
+                    continue;
+                }
+                Class<?> argType = constructor.getParameterTypes()[0];
+                if (argType.isAssignableFrom(parameterSuperType) || parameterSuperType.isAssignableFrom(argType)) {
+                    makeAccessible(constructor);
+                    return constructor;
+                }
+            }
+            return null;
+        }
+
+        private static Method requireNoArgMethod(Class<?> owner, boolean requireStatic, String... names) throws NoSuchMethodException {
+            Method method = findNoArgMethod(owner, requireStatic, names);
+            if (method == null) {
+                throw new NoSuchMethodException("No compatible no-arg method found on " + owner.getName());
+            }
+            return method;
+        }
+
+        private static Method requireMethodWithSingleParam(
+            Class<?> owner,
+            boolean requireStatic,
+            Class<?> requiredParamType,
+            Class<?> requiredReturnType,
+            String... names
+        ) throws NoSuchMethodException {
+            Method method = findMethodWithSingleParam(owner, requireStatic, requiredParamType, requiredReturnType, names);
+            if (method == null) {
+                throw new NoSuchMethodException("No compatible single-arg method found on " + owner.getName());
+            }
+            return method;
+        }
+
+        private static Method findExactMethod(Class<?> owner, String name, Class<?>... parameterTypes) {
+            try {
+                Method method = owner.getMethod(name, parameterTypes);
+                makeAccessible(method);
+                return method;
+            } catch (NoSuchMethodException ignored) {
+            }
+            try {
+                Method method = owner.getDeclaredMethod(name, parameterTypes);
+                makeAccessible(method);
+                return method;
+            } catch (NoSuchMethodException ignored) {
+            }
+            return null;
+        }
+
+        private static Method findNoArgMethod(Class<?> owner, boolean requireStatic, String... names) {
+            Method method = findMethodWithArity(owner, requireStatic, 0, names);
+            return method;
+        }
+
+        private static Method findMethodWithSingleParam(
+            Class<?> owner,
+            boolean requireStatic,
+            Class<?> requiredParamType,
+            Class<?> requiredReturnType,
+            String... names
+        ) {
+            Method[] all = allMethods(owner);
+            for (String name : names) {
+                for (Method method : all) {
+                    if (!name.equals(method.getName())) {
+                        continue;
+                    }
+                    if (!isMethodCompatible(method, requireStatic, 1)) {
+                        continue;
+                    }
+                    Class<?> parameterType = method.getParameterTypes()[0];
+                    if (!parameterType.isAssignableFrom(requiredParamType) && !requiredParamType.isAssignableFrom(parameterType)) {
+                        continue;
+                    }
+                    if (requiredReturnType != null && !requiredReturnType.isAssignableFrom(method.getReturnType())) {
+                        continue;
+                    }
+                    makeAccessible(method);
+                    return method;
+                }
+            }
+            return null;
+        }
+
+        private static Method findMethodWithArity(Class<?> owner, boolean requireStatic, int arity, String... names) {
+            Method[] all = allMethods(owner);
+            for (String name : names) {
+                for (Method method : all) {
+                    if (!name.equals(method.getName())) {
+                        continue;
+                    }
+                    if (!isMethodCompatible(method, requireStatic, arity)) {
+                        continue;
+                    }
+                    makeAccessible(method);
+                    return method;
+                }
+            }
+            return null;
+        }
+
+        private static Method findStaticFactoryMethod(Class<?> owner) {
+            Method[] all = allMethods(owner);
+            for (Method method : all) {
+                if (!Modifier.isStatic(method.getModifiers())) {
+                    continue;
+                }
+                if (method.getParameterCount() != 0) {
+                    continue;
+                }
+                if (!owner.isAssignableFrom(method.getReturnType())) {
+                    continue;
+                }
+                makeAccessible(method);
+                return method;
+            }
+            return null;
+        }
+
+        private static Method findNoArgMapMethod(Class<?> owner, boolean requireStatic) {
+            Method[] all = allMethods(owner);
+            for (Method method : all) {
+                if (!isMethodCompatible(method, requireStatic, 0)) {
+                    continue;
+                }
+                if (!Map.class.isAssignableFrom(method.getReturnType())) {
+                    continue;
+                }
+                makeAccessible(method);
+                return method;
+            }
+            return null;
+        }
+
+        private static Method findFloatGetter(Class<?> owner, String... names) {
+            Method[] all = allMethods(owner);
+            for (String name : names) {
+                for (Method method : all) {
+                    if (!name.equals(method.getName())) {
+                        continue;
+                    }
+                    if (method.getParameterCount() != 0) {
+                        continue;
+                    }
+                    if (!isNumericType(method.getReturnType())) {
+                        continue;
+                    }
+                    makeAccessible(method);
+                    return method;
+                }
+            }
+            return null;
+        }
+
+        private static Field findFloatField(Class<?> owner, String... names) {
+            Field field = findField(owner, names);
+            if (field == null) {
+                return null;
+            }
+            if (!isNumericType(field.getType())) {
+                return null;
+            }
+            return field;
+        }
+
+        private static Field findField(Class<?> owner, String... names) {
+            Field[] publicFields = owner.getFields();
+            for (String name : names) {
+                for (Field field : publicFields) {
+                    if (name.equals(field.getName())) {
+                        makeAccessible(field);
+                        return field;
+                    }
+                }
+            }
+
+            Field[] declaredFields = owner.getDeclaredFields();
+            for (String name : names) {
+                for (Field field : declaredFields) {
+                    if (name.equals(field.getName())) {
+                        makeAccessible(field);
+                        return field;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private static boolean isMethodCompatible(Method method, boolean requireStatic, int arity) {
+            if (method.getParameterCount() != arity) {
+                return false;
+            }
+            if (requireStatic && !Modifier.isStatic(method.getModifiers())) {
+                return false;
+            }
+            return true;
+        }
+
+        private static boolean isNumericType(Class<?> type) {
+            if (type.isPrimitive()) {
+                return type == Float.TYPE || type == Double.TYPE || type == Integer.TYPE || type == Long.TYPE
+                    || type == Short.TYPE || type == Byte.TYPE;
+            }
+            return Number.class.isAssignableFrom(type);
+        }
+
+        private static Method[] allMethods(Class<?> owner) {
+            Method[] publicMethods = owner.getMethods();
+            Method[] declaredMethods = owner.getDeclaredMethods();
+            Method[] out = new Method[publicMethods.length + declaredMethods.length];
+            System.arraycopy(publicMethods, 0, out, 0, publicMethods.length);
+            System.arraycopy(declaredMethods, 0, out, publicMethods.length, declaredMethods.length);
+            return out;
+        }
+
+        private static void makeAccessible(java.lang.reflect.AccessibleObject object) {
+            try {
+                object.setAccessible(true);
+            } catch (Throwable ignored) {
+            }
         }
     }
 
@@ -936,7 +1586,6 @@ public final class EntityLayerObjExporter {
             this.currentPart = partName;
             this.objWriter.println();
             this.objWriter.println("o " + partName);
-            this.objWriter.println("g " + partName);
             this.objWriter.println("usemtl " + MATERIAL_NAME);
         }
 
