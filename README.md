@@ -37,7 +37,26 @@ python .\export_entity_models.py `
 - `--no-flip-v`: disables OBJ UV V flip.
 - `--flip-z`: mirrors Z axis.
 - `--no-split-cubes`: keeps old behavior (merges cubes under each model part).
+- `--no-clamp-uv`: keeps original UV values (can cause wrapping artifacts in some tools).
 - `--scale <number>`: applies global scale.
+
+## Render Isometric Previews (Blender)
+Renders one PNG per exported OBJ using its MTL/textures, with simple Minecraft-style lighting and pixel texture filtering.
+
+```powershell
+blender -b -P .\render_entity_models_blender.py -- `
+  --input-dir .\exports\entity-models `
+  --output-dir .\renders\entity-models-isometric `
+  --resolution 768
+```
+
+Useful render flags:
+- `--skip-existing`: skip PNG files that already exist.
+- `--margin <number>`: framing padding (default `1.12`; lower = tighter zoom).
+- `--limit <N>`: render only first N models for quick tests.
+- `--name-filter <text>`: render only model files whose name contains `<text>`.
+- `--transparent-bg`: transparent background.
+- `--iso-azimuth <deg>`: camera turn around Z (default `135`).
 
 ## Output
 - One `.obj` + `.mtl` per model layer.

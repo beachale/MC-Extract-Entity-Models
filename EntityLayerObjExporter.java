@@ -225,10 +225,14 @@ public final class EntityLayerObjExporter {
 
                 vertexIndices[i] = writer.writeVertex(x * config.scale, y * config.scale, z * config.scale);
 
-                float u = ctx.getVertexU(vertex);
-                float v = ctx.getVertexV(vertex);
+                float u = finiteOrDefault(ctx.getVertexU(vertex), 0.0f);
+                float v = finiteOrDefault(ctx.getVertexV(vertex), 0.0f);
                 if (config.flipV) {
                     v = 1.0f - v;
+                }
+                if (config.clampUv) {
+                    u = clamp01(u);
+                    v = clamp01(v);
                 }
 
                 uvIndices[i] = writer.writeTexCoord(u, v);
@@ -271,6 +275,20 @@ public final class EntityLayerObjExporter {
 
     private static boolean isIntegralNumber(Object value) {
         return value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long;
+    }
+
+    private static float clamp01(float value) {
+        if (value < 0.0f) {
+            return 0.0f;
+        }
+        if (value > 1.0f) {
+            return 1.0f;
+        }
+        return value;
+    }
+
+    private static float finiteOrDefault(float value, float fallback) {
+        return Float.isFinite(value) ? value : fallback;
     }
 
     private static String normalizePartPath(String rawPath) {
@@ -391,6 +409,7 @@ public final class EntityLayerObjExporter {
         final boolean flipV;
         final boolean flipZ;
         final boolean splitCubes;
+        final boolean clampUv;
         final float scale;
 
         Config(
@@ -401,6 +420,7 @@ public final class EntityLayerObjExporter {
             boolean flipV,
             boolean flipZ,
             boolean splitCubes,
+            boolean clampUv,
             float scale
         ) {
             this.outputDir = outputDir;
@@ -410,6 +430,7 @@ public final class EntityLayerObjExporter {
             this.flipV = flipV;
             this.flipZ = flipZ;
             this.splitCubes = splitCubes;
+            this.clampUv = clampUv;
             this.scale = scale;
         }
 
@@ -425,6 +446,7 @@ public final class EntityLayerObjExporter {
             boolean flipV = true;
             boolean flipZ = false;
             boolean splitCubes = true;
+            boolean clampUv = true;
             float scale = 1.0f;
 
             for (int i = 0; i < args.length; i++) {
@@ -445,6 +467,8 @@ public final class EntityLayerObjExporter {
                     flipZ = parseBoolean(requireValue(args, ++i, "--flip-z"));
                 } else if ("--split-cubes".equals(arg)) {
                     splitCubes = parseBoolean(requireValue(args, ++i, "--split-cubes"));
+                } else if ("--clamp-uv".equals(arg)) {
+                    clampUv = parseBoolean(requireValue(args, ++i, "--clamp-uv"));
                 } else if ("--scale".equals(arg)) {
                     scale = Float.parseFloat(requireValue(args, ++i, "--scale"));
                 } else {
@@ -460,7 +484,7 @@ public final class EntityLayerObjExporter {
                 throw new IllegalArgumentException("Client jar not found: " + clientJarPath.toAbsolutePath());
             }
 
-            return new Config(outputDir, clientJarPath, applyRuntimeOrientation, liftToGrid, flipV, flipZ, splitCubes, scale);
+            return new Config(outputDir, clientJarPath, applyRuntimeOrientation, liftToGrid, flipV, flipZ, splitCubes, clampUv, scale);
         }
 
         private static String requireValue(String[] args, int index, String flag) {
@@ -482,7 +506,7 @@ public final class EntityLayerObjExporter {
 
         private static void printUsageAndExit(int code) {
             System.out.println("Usage:");
-            System.out.println("  java EntityLayerObjExporter --out <outputDir> [--client-jar <clientJar>] [--runtime-orientation true|false] [--lift-to-grid true|false] [--flip-v true|false] [--flip-z true|false] [--split-cubes true|false] [--scale <float>]");
+            System.out.println("  java EntityLayerObjExporter --out <outputDir> [--client-jar <clientJar>] [--runtime-orientation true|false] [--lift-to-grid true|false] [--flip-v true|false] [--flip-z true|false] [--split-cubes true|false] [--clamp-uv true|false] [--scale <float>]");
             System.exit(code);
         }
     }
@@ -536,36 +560,23 @@ public final class EntityLayerObjExporter {
         };
 
         private static final String[] MAIN_LAYER_PENALTY_HINTS = new String[] {
-            "_eyes",
             "eyes",
-            "_armor",
             "armor",
-            "_saddle",
             "saddle",
-            "_pattern",
             "pattern",
-            "_overlay",
             "overlay",
-            "_glow",
             "glow",
-            "_emissive",
             "emissive",
-            "_wind",
             "wind",
-            "_heart",
             "heart",
-            "_tendrils",
             "tendrils",
-            "_collar",
             "collar",
-            "_harness",
             "harness",
-            "_ropes",
             "ropes",
-            "_spots",
             "spots",
-            "_undercoat",
-            "undercoat"
+            "undercoat",
+            "outer",
+            "inner"
         };
 
         private final ZipFile zipFile;
@@ -596,7 +607,9 @@ public final class EntityLayerObjExporter {
                 if (!lower.contains("/textures/")) {
                     continue;
                 }
-                if (!lower.contains("/textures/entity/") && !lower.contains("/textures/models/armor/")) {
+                if (!lower.contains("/textures/entity/")
+                        && !lower.contains("/textures/models/armor/")
+                        && !lower.endsWith("/textures/block/water_still.png")) {
                     continue;
                 }
 
@@ -626,6 +639,11 @@ public final class EntityLayerObjExporter {
             String modelPathLower = info.modelPath.toLowerCase(Locale.ROOT);
             String layerLower = info.layer.toLowerCase(Locale.ROOT);
 
+            String knownEntry = findKnownTextureEntry(namespaceLower, modelPathLower, layerLower);
+            if (knownEntry != null) {
+                return resolvedFromEntry(knownEntry);
+            }
+
             String flatModel = modelPathLower.replace('/', '_');
             String lastSegment = modelPathLower;
             int slash = lastSegment.lastIndexOf('/');
@@ -635,18 +653,30 @@ public final class EntityLayerObjExporter {
 
             String canonicalFlat = stripSuffixes(flatModel);
             String canonicalLast = stripSuffixes(lastSegment);
+            String compactFlat = flatModel.replace("_", "");
+            String compactLast = lastSegment.replace("_", "");
+            String compactCanonicalFlat = canonicalFlat.replace("_", "");
+            String compactCanonicalLast = canonicalLast.replace("_", "");
 
             LinkedHashSet<String> names = new LinkedHashSet<String>();
             addName(names, flatModel);
             addName(names, lastSegment);
             addName(names, canonicalFlat);
             addName(names, canonicalLast);
+            addName(names, compactFlat);
+            addName(names, compactLast);
+            addName(names, compactCanonicalFlat);
+            addName(names, compactCanonicalLast);
 
             if (!"main".equals(layerLower)) {
                 addName(names, flatModel + "_" + layerLower);
                 addName(names, lastSegment + "_" + layerLower);
                 addName(names, canonicalFlat + "_" + layerLower);
                 addName(names, canonicalLast + "_" + layerLower);
+                addName(names, compactFlat + "_" + layerLower);
+                addName(names, compactLast + "_" + layerLower);
+                addName(names, compactCanonicalFlat + "_" + layerLower);
+                addName(names, compactCanonicalLast + "_" + layerLower);
             }
 
             Set<String> modelTokens = tokenize(flatModel);
@@ -674,7 +704,8 @@ public final class EntityLayerObjExporter {
                     modelTokens,
                     layerTokens,
                     flatModel,
-                    canonicalFlat
+                    canonicalFlat,
+                    lastSegment
                 );
 
                 if (score > bestScore) {
@@ -683,21 +714,325 @@ public final class EntityLayerObjExporter {
                 }
             }
 
-            if (bestEntry == null || bestScore < 120) {
+            if (bestEntry == null || bestScore < 90) {
                 return null;
             }
 
-            String lowerBest = bestEntry.toLowerCase(Locale.ROOT);
-            int texturesIndex = lowerBest.indexOf("/textures/");
+            return resolvedFromEntry(bestEntry);
+        }
+
+        private ResolvedTexture resolvedFromEntry(String entry) {
+            String lower = entry.toLowerCase(Locale.ROOT);
+            int texturesIndex = lower.indexOf("/textures/");
             if (texturesIndex < 0) {
                 return null;
             }
 
-            String subPath = bestEntry.substring(texturesIndex + "/textures/".length());
+            String subPath = entry.substring(texturesIndex + "/textures/".length());
             Path extractedPath = this.outputDir.resolve("textures").resolve(subPath.replace('/', java.io.File.separatorChar));
             String mapKd = toForwardSlashes(this.outputDir.relativize(extractedPath).toString());
+            return new ResolvedTexture(entry, extractedPath, mapKd);
+        }
 
-            return new ResolvedTexture(bestEntry, extractedPath, mapKd);
+        private String findKnownTextureEntry(String namespaceLower, String modelPathLower, String layerLower) {
+            if (!"minecraft".equals(namespaceLower)) {
+                return null;
+            }
+            String modelKey = modelPathLower.replace('/', '_');
+
+            if (modelKey.endsWith("_minecart")) {
+                String candidate = "assets/minecraft/textures/entity/minecart/minecart.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("boat".equals(modelKey) && "water_patch".equals(layerLower)) {
+                String candidate = "assets/minecraft/textures/block/water_still.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("sniffer_baby".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/sniffer/snifflet.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("armor_stand".equals(modelKey) || "armor_stand_small".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/armorstand/armorstand.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("giant".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/zombie/zombie.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("player".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/player/wide/steve.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+            if ("player_slim".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/player/slim/steve.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("leash_knot".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/lead_knot/lead_knot.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("dragon_skull".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/enderdragon/dragon.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("double_chest_left".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/chest/normal_left.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+            if ("double_chest_right".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/chest/normal_right.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("bed_foot".equals(modelKey) || "bed_head".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/bed/red.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("decorated_pot_sides".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/decorated_pot/decorated_pot_side.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("conduit".equals(modelKey) && "shell".equals(layerLower)) {
+                String candidate = "assets/minecraft/textures/entity/conduit/base.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if (modelKey.startsWith("hanging_sign_")) {
+                String wood = detectWoodType(modelKey);
+                if (wood != null) {
+                    String candidate = "assets/minecraft/textures/entity/signs/hanging/" + wood + ".png";
+                    if (hasTextureEntry(candidate)) {
+                        return candidate;
+                    }
+                }
+            }
+
+            if ("standing_banner".equals(modelKey) || "wall_banner".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/banner/base.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("pufferfish_big".equals(modelKey) || "pufferfish_medium".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/fish/pufferfish.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+            if ("salmon_large".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/fish/salmon.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+            if ("tropical_fish_small".equals(modelKey)) {
+                String candidate = "main".equals(layerLower)
+                    ? "assets/minecraft/textures/entity/fish/tropical_a.png"
+                    : "assets/minecraft/textures/entity/fish/tropical_a_pattern_1.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+            if ("tropical_fish_large".equals(modelKey)) {
+                String candidate = "main".equals(layerLower)
+                    ? "assets/minecraft/textures/entity/fish/tropical_b.png"
+                    : "assets/minecraft/textures/entity/fish/tropical_b_pattern_1.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("shulker_box".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/shulker/shulker.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+            if ("shulker_bullet".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/shulker/spark.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("skeleton_skull".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/skeleton/skeleton.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+            if ("wither_skeleton_skull".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/skeleton/wither_skeleton.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+            if ("wither_skull".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/wither/wither.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("undead_horse_armor".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/horse/horse_zombie.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("spin_attack".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/trident/trident_riptide.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("llama".equals(modelKey) && "decor".equals(layerLower)) {
+                String candidate = "assets/minecraft/textures/entity/llama/llama_white.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+            if ("llama_baby".equals(modelKey) && "decor".equals(layerLower)) {
+                String candidate = "assets/minecraft/textures/entity/llama/llama_white_baby.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if (modelKey.startsWith("copper_golem_") && "main".equals(layerLower)) {
+                String candidate = "assets/minecraft/textures/entity/copper_golem/copper_golem.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if ("drowned".equals(modelKey) || "drowned_baby".equals(modelKey)) {
+                boolean baby = modelKey.contains("baby");
+                if (layerLower.contains("outer")) {
+                    String candidate = baby
+                        ? "assets/minecraft/textures/entity/zombie/drowned_outer_layer_baby.png"
+                        : "assets/minecraft/textures/entity/zombie/drowned_outer_layer.png";
+                    if (hasTextureEntry(candidate)) {
+                        return candidate;
+                    }
+                }
+
+                String candidate = baby
+                    ? "assets/minecraft/textures/entity/zombie/drowned_baby.png"
+                    : "assets/minecraft/textures/entity/zombie/drowned.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if (modelKey.startsWith("villager")) {
+                boolean baby = modelKey.contains("_baby");
+                String candidate = baby
+                    ? "assets/minecraft/textures/entity/villager/villager_baby.png"
+                    : "assets/minecraft/textures/entity/villager/villager.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if (modelKey.startsWith("zombie_villager")) {
+                boolean baby = modelKey.contains("_baby");
+                String candidate = baby
+                    ? "assets/minecraft/textures/entity/zombie_villager/zombie_villager_baby.png"
+                    : "assets/minecraft/textures/entity/zombie_villager/zombie_villager.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            if (modelPathLower.contains("happy_ghast") && modelPathLower.contains("harness")) {
+                String candidate = "assets/minecraft/textures/entity/equipment/happy_ghast_body/white_harness.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+            if (modelPathLower.contains("happy_ghast") && modelPathLower.contains("ropes")) {
+                String candidate = "assets/minecraft/textures/entity/ghast/happy_ghast_ropes.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+
+            return null;
+        }
+
+        private static String detectWoodType(String modelPathLower) {
+            String[] woods = new String[] {
+                "acacia",
+                "bamboo",
+                "birch",
+                "cherry",
+                "crimson",
+                "dark_oak",
+                "jungle",
+                "mangrove",
+                "oak",
+                "pale_oak",
+                "spruce",
+                "warped"
+            };
+            for (String wood : woods) {
+                if (modelPathLower.contains("_" + wood + "_")) {
+                    return wood;
+                }
+            }
+            return null;
+        }
+
+        private boolean hasTextureEntry(String entryName) {
+            for (String entry : this.textureEntries) {
+                if (entryName.equalsIgnoreCase(entry)) {
+                    return true;
+                }
+            }
+            return false;
         }
         private static int scoreEntry(
             String entry,
@@ -707,9 +1042,14 @@ public final class EntityLayerObjExporter {
             Set<String> modelTokens,
             Set<String> layerTokens,
             String flatModel,
-            String canonicalFlat
+            String canonicalFlat,
+            String lastSegment
         ) {
             int score = 0;
+            Set<String> entryTokens = tokenize(entry);
+            String fileName = extractFileNameWithoutExtension(entry);
+            Set<String> fileNameTokens = tokenize(fileName);
+            boolean modelHasBaby = modelTokens.contains("baby") || modelPathLower.contains("_baby");
 
             if (entry.contains("/textures/entity/")) {
                 score += 50;
@@ -728,7 +1068,6 @@ public final class EntityLayerObjExporter {
                 score += 200;
             }
 
-            String fileName = extractFileNameWithoutExtension(entry);
             for (String name : names) {
                 if (fileName.equals(name)) {
                     score += 180;
@@ -746,8 +1085,8 @@ public final class EntityLayerObjExporter {
 
             int matchedModelTokens = 0;
             for (String token : modelTokens) {
-                if (token.length() > 2 && entry.contains(token)) {
-                    score += 7;
+                if (token.length() > 2 && (entryTokens.contains(token) || fileNameTokens.contains(token))) {
+                    score += 14;
                     matchedModelTokens++;
                 }
             }
@@ -756,25 +1095,30 @@ public final class EntityLayerObjExporter {
                 score += 70;
             }
 
-            if (layerLower.contains("baby")) {
-                if (entry.contains("baby")) {
-                    score += 35;
+            if (modelHasBaby) {
+                if (entryTokens.contains("baby") || fileNameTokens.contains("baby")) {
+                    score += 50;
                 }
-            } else if (entry.contains("baby")) {
-                score -= 20;
+            } else if (entryTokens.contains("baby") || fileNameTokens.contains("baby")) {
+                score -= 30;
             }
 
             if ("main".equals(layerLower)) {
                 for (String hint : MAIN_LAYER_PENALTY_HINTS) {
-                    if (entry.contains(hint)) {
-                        score -= 70;
+                    if ((entryTokens.contains(hint) || fileNameTokens.contains(hint)) && !modelTokens.contains(hint)) {
+                        score -= 55;
                     }
                 }
             } else {
+                int matchedLayerTokens = 0;
                 for (String token : layerTokens) {
-                    if (token.length() > 2 && entry.contains(token)) {
+                    if (token.length() > 2 && (entryTokens.contains(token) || fileNameTokens.contains(token))) {
                         score += 40;
+                        matchedLayerTokens++;
                     }
+                }
+                if (!layerTokens.isEmpty() && matchedLayerTokens == 0) {
+                    score -= 200;
                 }
 
                 if (layerLower.contains("armor") || layerLower.contains("boots") || layerLower.contains("leggings")
@@ -782,6 +1126,26 @@ public final class EntityLayerObjExporter {
                     if (entry.contains("/textures/models/armor/")) {
                         score += 90;
                     }
+                }
+            }
+
+            if (layerLower.contains("outer") && (entryTokens.contains("outer") || entry.contains("outer_layer"))) {
+                score += 110;
+            }
+            if (layerLower.contains("inner") && entryTokens.contains("inner")) {
+                score += 80;
+            }
+
+            if (modelTokens.contains("armor") && modelTokens.contains("stand") && "armorstand".equals(fileName)) {
+                score += 260;
+            }
+            if (modelHasBaby && (modelTokens.contains("sniffer") || "sniffer_baby".equals(lastSegment)) && "snifflet".equals(fileName)) {
+                score += 300;
+            }
+            if (modelTokens.contains("harness") && fileName.endsWith("_harness")) {
+                score += 170;
+                if (fileName.startsWith("white_")) {
+                    score += 120;
                 }
             }
 
@@ -1590,18 +1954,26 @@ public final class EntityLayerObjExporter {
         }
 
         int writeVertex(float x, float y, float z) {
+            x = finiteOrDefault(x, 0.0f);
+            y = finiteOrDefault(y, 0.0f);
+            z = finiteOrDefault(z, 0.0f);
             this.vertexCount++;
             this.objWriter.printf(Locale.ROOT, "v %.8f %.8f %.8f%n", Float.valueOf(x), Float.valueOf(y), Float.valueOf(z));
             return this.vertexCount;
         }
 
         int writeTexCoord(float u, float v) {
+            u = finiteOrDefault(u, 0.0f);
+            v = finiteOrDefault(v, 0.0f);
             this.uvCount++;
             this.objWriter.printf(Locale.ROOT, "vt %.8f %.8f%n", Float.valueOf(u), Float.valueOf(v));
             return this.uvCount;
         }
 
         int writeNormal(float x, float y, float z) {
+            x = finiteOrDefault(x, 0.0f);
+            y = finiteOrDefault(y, 0.0f);
+            z = finiteOrDefault(z, 0.0f);
             this.normalCount++;
             this.objWriter.printf(Locale.ROOT, "vn %.8f %.8f %.8f%n", Float.valueOf(x), Float.valueOf(y), Float.valueOf(z));
             return this.normalCount;
