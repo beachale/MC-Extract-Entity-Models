@@ -55,11 +55,13 @@ public final class EntityLayerObjExporter {
         int exported = 0;
         int failed = 0;
         int index = 0;
+        int extractedTextures = 0;
 
         TextureResolver textureResolver = null;
         try {
             if (config.clientJarPath != null) {
                 textureResolver = new TextureResolver(config.clientJarPath, config.outputDir);
+                extractedTextures = textureResolver.extractAllTrackedTextures();
             }
 
             for (Object location : locations) {
@@ -103,9 +105,10 @@ public final class EntityLayerObjExporter {
 
         System.out.printf(
             Locale.ROOT,
-            "Done. Exported: %d, Failed: %d, Output: %s%n",
+            "Done. Exported: %d, Failed: %d, Extracted textures: %d, Output: %s%n",
             Integer.valueOf(exported),
             Integer.valueOf(failed),
+            Integer.valueOf(extractedTextures),
             config.outputDir.toAbsolutePath().toString()
         );
 
@@ -634,6 +637,21 @@ public final class EntityLayerObjExporter {
             return resolved;
         }
 
+        int extractAllTrackedTextures() throws IOException {
+            int extractedCount = 0;
+            for (String entry : this.textureEntries) {
+                ResolvedTexture resolved = resolvedFromEntry(entry);
+                if (resolved == null || this.extracted.contains(resolved.sourceEntry)) {
+                    continue;
+                }
+                extractIfNeeded(resolved);
+                if (this.extracted.contains(resolved.sourceEntry)) {
+                    extractedCount++;
+                }
+            }
+            return extractedCount;
+        }
+
         private ResolvedTexture resolve(LocationInfo info) {
             String namespaceLower = info.namespace.toLowerCase(Locale.ROOT);
             String modelPathLower = info.modelPath.toLowerCase(Locale.ROOT);
@@ -657,6 +675,7 @@ public final class EntityLayerObjExporter {
             String compactLast = lastSegment.replace("_", "");
             String compactCanonicalFlat = canonicalFlat.replace("_", "");
             String compactCanonicalLast = canonicalLast.replace("_", "");
+            boolean hasCanonicalFileNameCandidates = hasNamespaceEntryWithFileNameToken(namespaceLower, canonicalLast);
 
             LinkedHashSet<String> names = new LinkedHashSet<String>();
             addName(names, flatModel);
@@ -705,7 +724,9 @@ public final class EntityLayerObjExporter {
                     layerTokens,
                     flatModel,
                     canonicalFlat,
-                    lastSegment
+                    lastSegment,
+                    canonicalLast,
+                    hasCanonicalFileNameCandidates
                 );
 
                 if (score > bestScore) {
@@ -810,6 +831,12 @@ public final class EntityLayerObjExporter {
             }
             if ("double_chest_right".equals(modelKey)) {
                 String candidate = "assets/minecraft/textures/entity/chest/normal_right.png";
+                if (hasTextureEntry(candidate)) {
+                    return candidate;
+                }
+            }
+            if ("chest".equals(modelKey)) {
+                String candidate = "assets/minecraft/textures/entity/chest/normal.png";
                 if (hasTextureEntry(candidate)) {
                     return candidate;
                 }
@@ -1043,13 +1070,16 @@ public final class EntityLayerObjExporter {
             Set<String> layerTokens,
             String flatModel,
             String canonicalFlat,
-            String lastSegment
+            String lastSegment,
+            String canonicalLast,
+            boolean hasCanonicalFileNameCandidates
         ) {
             int score = 0;
             Set<String> entryTokens = tokenize(entry);
             String fileName = extractFileNameWithoutExtension(entry);
             Set<String> fileNameTokens = tokenize(fileName);
             boolean modelHasBaby = modelTokens.contains("baby") || modelPathLower.contains("_baby");
+            boolean fileNameHasCanonicalToken = hasTokenInFileName(fileName, fileNameTokens, canonicalLast);
 
             if (entry.contains("/textures/entity/")) {
                 score += 50;
@@ -1093,6 +1123,13 @@ public final class EntityLayerObjExporter {
 
             if (!modelTokens.isEmpty() && matchedModelTokens == modelTokens.size()) {
                 score += 70;
+            }
+            if (hasCanonicalFileNameCandidates) {
+                if (fileNameHasCanonicalToken) {
+                    score += 110;
+                } else {
+                    score -= 110;
+                }
             }
 
             if (modelHasBaby) {
@@ -1150,6 +1187,39 @@ public final class EntityLayerObjExporter {
             }
 
             return score;
+        }
+
+        private boolean hasNamespaceEntryWithFileNameToken(String namespaceLower, String token) {
+            if (token == null || token.length() <= 2) {
+                return false;
+            }
+            for (String entry : this.textureEntries) {
+                String lower = entry.toLowerCase(Locale.ROOT);
+                if (!lower.startsWith("assets/" + namespaceLower + "/")) {
+                    continue;
+                }
+                String fileName = extractFileNameWithoutExtension(lower);
+                Set<String> fileNameTokens = tokenize(fileName);
+                if (hasTokenInFileName(fileName, fileNameTokens, token)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static boolean hasTokenInFileName(String fileName, Set<String> fileNameTokens, String token) {
+            if (token == null || token.length() <= 2) {
+                return false;
+            }
+            if (token.equals(fileName)) {
+                return true;
+            }
+            if (fileNameTokens.contains(token)) {
+                return true;
+            }
+            return fileName.startsWith(token + "_")
+                || fileName.endsWith("_" + token)
+                || fileName.contains("_" + token + "_");
         }
 
         private static String extractFileNameWithoutExtension(String entry) {
@@ -1325,10 +1395,14 @@ public final class EntityLayerObjExporter {
                 "bakeLayer"
             );
 
-            Method createRoots = findNoArgMethod(layerDefinitionsClass, true, "createRoots");
-            if (createRoots == null) {
-                createRoots = findNoArgMapMethod(layerDefinitionsClass, true);
-            }
+            Method createRoots = findMapFactoryMethod(
+                layerDefinitionsClass,
+                true,
+                "createRoots",
+                "roots",
+                "buildRoots",
+                "create"
+            );
             if (createRoots == null) {
                 throw new NoSuchMethodException("LayerDefinitions#createRoots compatible method was not found.");
             }
@@ -1800,19 +1874,66 @@ public final class EntityLayerObjExporter {
             return null;
         }
 
-        private static Method findNoArgMapMethod(Class<?> owner, boolean requireStatic) {
+        private static Method findMapFactoryMethod(Class<?> owner, boolean requireStatic, String... preferredNames) {
             Method[] all = allMethods(owner);
-            for (Method method : all) {
-                if (!isMethodCompatible(method, requireStatic, 0)) {
-                    continue;
+            for (String preferredName : preferredNames) {
+                Method bestNamed = null;
+                for (Method method : all) {
+                    if (!preferredName.equals(method.getName())) {
+                        continue;
+                    }
+                    if (!isMapFactoryCandidate(method, requireStatic)) {
+                        continue;
+                    }
+                    if (bestNamed == null || method.getParameterCount() < bestNamed.getParameterCount()) {
+                        bestNamed = method;
+                    }
                 }
-                if (!Map.class.isAssignableFrom(method.getReturnType())) {
-                    continue;
+                if (bestNamed != null) {
+                    makeAccessible(bestNamed);
+                    return bestNamed;
                 }
-                makeAccessible(method);
-                return method;
             }
-            return null;
+
+            Method best = null;
+            int bestScore = Integer.MIN_VALUE;
+            for (Method method : all) {
+                if (!isMapFactoryCandidate(method, requireStatic)) {
+                    continue;
+                }
+                int score = scoreMapFactoryCandidate(method);
+                if (best == null || score > bestScore) {
+                    best = method;
+                    bestScore = score;
+                }
+            }
+            if (best != null) {
+                makeAccessible(best);
+            }
+            return best;
+        }
+
+        private static boolean isMapFactoryCandidate(Method method, boolean requireStatic) {
+            if (requireStatic && !Modifier.isStatic(method.getModifiers())) {
+                return false;
+            }
+            return Map.class.isAssignableFrom(method.getReturnType());
+        }
+
+        private static int scoreMapFactoryCandidate(Method method) {
+            String name = method.getName().toLowerCase(Locale.ROOT);
+            int score = 0;
+            score -= method.getParameterCount() * 10;
+            if (name.contains("root")) {
+                score += 70;
+            }
+            if (name.contains("layer")) {
+                score += 20;
+            }
+            if (name.startsWith("create")) {
+                score += 15;
+            }
+            return score;
         }
 
         private static Method findFloatGetter(Class<?> owner, String... names) {
