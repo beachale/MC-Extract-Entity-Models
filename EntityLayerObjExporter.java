@@ -1,3 +1,4 @@
+import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -25,6 +26,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -43,14 +45,10 @@ public final class EntityLayerObjExporter {
         ctx.initializeGameData();
         Map<Object, Object> roots = ctx.createRoots();
         Object entityModelSet = ctx.createEntityModelSet(roots);
+        RuntimeOrientationResolver orientationResolver = RuntimeOrientationResolver.create(ctx, config.clientJarPath);
 
         List<Object> locations = new ArrayList<Object>(roots.keySet());
-        locations.sort(new Comparator<Object>() {
-            @Override
-            public int compare(Object a, Object b) {
-                return a.toString().compareTo(b.toString());
-            }
-        });
+        locations.sort(Comparator.comparing(Object::toString));
 
         int exported = 0;
         int failed = 0;
@@ -80,10 +78,11 @@ public final class EntityLayerObjExporter {
 
                     String textureMapPath = texture != null ? texture.mapKdPath : null;
                     String textureSource = texture != null ? texture.sourceEntry : null;
+                    boolean applyRuntimeOrientation = config.applyRuntimeOrientation && orientationResolver.shouldApply(location);
 
                     try (ObjWriter writer = new ObjWriter(objPath, mtlPath, location.toString(), textureMapPath, textureSource)) {
                         Object rootPart = ctx.bakeLayer(entityModelSet, location);
-                        exportModel(ctx, rootPart, writer, config);
+                        exportModel(ctx, rootPart, writer, config, applyRuntimeOrientation);
                     }
                     if (config.liftToGrid) {
                         liftModelToGrid(objPath);
@@ -106,9 +105,9 @@ public final class EntityLayerObjExporter {
         System.out.printf(
             Locale.ROOT,
             "Done. Exported: %d, Failed: %d, Extracted textures: %d, Output: %s%n",
-            Integer.valueOf(exported),
-            Integer.valueOf(failed),
-            Integer.valueOf(extractedTextures),
+            exported,
+            failed,
+            extractedTextures,
             config.outputDir.toAbsolutePath().toString()
         );
 
@@ -117,7 +116,12 @@ public final class EntityLayerObjExporter {
         }
     }
 
-    private static void exportModel(final ReflectionContext ctx, Object rootPart, final ObjWriter writer, final Config config)
+    private static void exportModel(
+            final ReflectionContext ctx,
+            Object rootPart,
+            final ObjWriter writer,
+            final Config config,
+            final boolean applyRuntimeOrientation)
             throws Exception {
         final Object poseStack = ctx.poseStackCtor.newInstance();
         final Map<String, Integer> cubeCountersByPart = new HashMap<String, Integer>();
@@ -161,19 +165,12 @@ public final class EntityLayerObjExporter {
                 String normalizedPath = normalizePartPath(path);
                 String partPath = normalizedPath;
                 if (config.splitCubes) {
-                    int resolvedIndex;
-                    if (cubeIndex != null && cubeIndex.intValue() >= 0) {
-                        resolvedIndex = cubeIndex.intValue();
-                    } else {
-                        Integer next = cubeCountersByPart.get(normalizedPath);
-                        resolvedIndex = next != null ? next.intValue() : 0;
-                        cubeCountersByPart.put(normalizedPath, Integer.valueOf(resolvedIndex + 1));
-                    }
-                    partPath = String.format(Locale.ROOT, "%s.cube_%03d", normalizedPath, Integer.valueOf(resolvedIndex));
+                    int resolvedIndex = resolveCubeIndex(normalizedPath, cubeIndex, cubeCountersByPart);
+                    partPath = formatSplitPartPath(normalizedPath, resolvedIndex);
                 }
 
                 writer.beginPart(sanitizeObjName(partPath));
-                exportCube(ctx, pose, cube, writer, config);
+                exportCube(ctx, pose, cube, writer, config, applyRuntimeOrientation);
                 return defaultReturnValue(method.getReturnType());
             }
         };
@@ -187,12 +184,18 @@ public final class EntityLayerObjExporter {
         ctx.modelPartVisitMethod.invoke(rootPart, poseStack, visitor);
     }
 
-    private static void exportCube(ReflectionContext ctx, Object pose, Object cube, ObjWriter writer, Config config)
+    private static void exportCube(
+            ReflectionContext ctx,
+            Object pose,
+            Object cube,
+            ObjWriter writer,
+            Config config,
+            boolean applyRuntimeOrientation)
             throws Exception {
         Object matrix = ctx.posePoseMethod.invoke(pose);
         Object[] polygons = ctx.getCubePolygons(cube);
-        float signX = config.applyRuntimeOrientation ? -1.0f : 1.0f;
-        float signY = config.applyRuntimeOrientation ? -1.0f : 1.0f;
+        float signX = applyRuntimeOrientation ? -1.0f : 1.0f;
+        float signY = applyRuntimeOrientation ? -1.0f : 1.0f;
         float signZ = config.flipZ ? -1.0f : 1.0f;
         boolean reverseWinding = signX * signY * signZ < 0.0f;
 
@@ -309,6 +312,24 @@ public final class EntityLayerObjExporter {
         }
 
         return value.replace('/', '.');
+    }
+
+    private static String formatSplitPartPath(String normalizedPath, int cubeIndex) {
+        if (cubeIndex <= 0) {
+            return normalizedPath;
+        }
+        return String.format(Locale.ROOT, "%s.cube_%03d", normalizedPath, Integer.valueOf(cubeIndex));
+    }
+
+    private static int resolveCubeIndex(String normalizedPath, Integer cubeIndex, Map<String, Integer> cubeCountersByPart) {
+        if (cubeIndex != null && cubeIndex.intValue() >= 0) {
+            return cubeIndex.intValue();
+        }
+
+        Integer next = cubeCountersByPart.get(normalizedPath);
+        int resolvedIndex = next != null ? next.intValue() : 0;
+        cubeCountersByPart.put(normalizedPath, Integer.valueOf(resolvedIndex + 1));
+        return resolvedIndex;
     }
 
     private static String sanitizeObjName(String value) {
@@ -1306,7 +1327,351 @@ public final class EntityLayerObjExporter {
         }
     }
 
+    private static final class RuntimeOrientationResolver {
+        private final Map<String, Boolean> applyByLocationKey;
+
+        private RuntimeOrientationResolver(Map<String, Boolean> applyByLocationKey) {
+            this.applyByLocationKey = applyByLocationKey;
+        }
+
+        static RuntimeOrientationResolver create(ReflectionContext ctx, Path clientJarPath) throws Exception {
+            Map<String, Boolean> applyByLocationKey = new HashMap<String, Boolean>();
+            if (clientJarPath == null || !Files.exists(clientJarPath)) {
+                return new RuntimeOrientationResolver(applyByLocationKey);
+            }
+
+            Map<String, String> fieldNameByLocationKey = discoverStaticLocations(ctx);
+            Map<String, String> factoryNameByLocationKey = discoverFactoryLocations(ctx);
+            UsageIndex usageIndex = scanJarUsage(clientJarPath);
+
+            Set<String> keys = new LinkedHashSet<String>();
+            keys.addAll(fieldNameByLocationKey.keySet());
+            keys.addAll(factoryNameByLocationKey.keySet());
+
+            for (String locationKey : keys) {
+                Usage usage = null;
+
+                String fieldName = fieldNameByLocationKey.get(locationKey);
+                if (fieldName != null) {
+                    usage = usageIndex.fieldUsage.get(fieldName);
+                }
+
+                if (usage == null) {
+                    String factoryName = factoryNameByLocationKey.get(locationKey);
+                    if (factoryName != null) {
+                        usage = usageIndex.factoryUsage.get(factoryName);
+                    }
+                }
+
+                if (usage != null) {
+                    applyByLocationKey.put(locationKey, Boolean.valueOf(usage.shouldApply()));
+                }
+            }
+
+            return new RuntimeOrientationResolver(applyByLocationKey);
+        }
+
+        boolean shouldApply(Object location) {
+            Boolean value = this.applyByLocationKey.get(String.valueOf(location));
+            return value == null ? true : value.booleanValue();
+        }
+
+        private static Map<String, String> discoverStaticLocations(ReflectionContext ctx) throws Exception {
+            Map<String, String> out = new HashMap<String, String>();
+            for (Field field : ctx.modelLayersClass.getDeclaredFields()) {
+                if (!Modifier.isStatic(field.getModifiers())) {
+                    continue;
+                }
+                if (!ctx.modelLayerLocationClass.equals(field.getType())) {
+                    continue;
+                }
+
+                ReflectionContext.makeAccessible(field);
+                Object value = field.get(null);
+                if (value != null) {
+                    out.put(String.valueOf(value), field.getName());
+                }
+            }
+            return out;
+        }
+
+        private static Map<String, String> discoverFactoryLocations(ReflectionContext ctx) throws Exception {
+            Map<String, String> out = new HashMap<String, String>();
+            for (Method method : ctx.modelLayersClass.getDeclaredMethods()) {
+                if (!Modifier.isStatic(method.getModifiers())) {
+                    continue;
+                }
+                if (!ctx.modelLayerLocationClass.equals(method.getReturnType())) {
+                    continue;
+                }
+
+                List<Object[]> argumentSets = enumerateArguments(method.getParameterTypes());
+                if (argumentSets == null) {
+                    continue;
+                }
+
+                ReflectionContext.makeAccessible(method);
+                for (Object[] arguments : argumentSets) {
+                    Object value;
+                    try {
+                        value = method.invoke(null, arguments);
+                    } catch (Throwable ignored) {
+                        continue;
+                    }
+                    if (value != null) {
+                        out.put(String.valueOf(value), method.getName());
+                    }
+                }
+            }
+            return out;
+        }
+
+        private static List<Object[]> enumerateArguments(Class<?>[] parameterTypes) {
+            List<Object[]> out = new ArrayList<Object[]>();
+            out.add(new Object[parameterTypes.length]);
+
+            for (int i = 0; i < parameterTypes.length; i++) {
+                Object[] values = enumerateParameterValues(parameterTypes[i]);
+                if (values == null) {
+                    return null;
+                }
+
+                List<Object[]> next = new ArrayList<Object[]>(out.size() * Math.max(values.length, 1));
+                for (Object[] existing : out) {
+                    for (Object value : values) {
+                        Object[] copy = new Object[parameterTypes.length];
+                        System.arraycopy(existing, 0, copy, 0, existing.length);
+                        copy[i] = value;
+                        next.add(copy);
+                    }
+                }
+                out = next;
+            }
+
+            return out;
+        }
+
+        private static Object[] enumerateParameterValues(Class<?> type) {
+            if (type.isEnum()) {
+                Object[] constants = type.getEnumConstants();
+                return constants != null && constants.length > 0 ? constants : null;
+            }
+            if (type == Boolean.TYPE || type == Boolean.class) {
+                return new Object[] { Boolean.FALSE, Boolean.TRUE };
+            }
+            try {
+                Method valuesMethod = type.getMethod("values");
+                if (Modifier.isStatic(valuesMethod.getModifiers()) && valuesMethod.getParameterCount() == 0) {
+                    Object values = valuesMethod.invoke(null);
+                    if (values instanceof Object[] && ((Object[]) values).length > 0) {
+                        return (Object[]) values;
+                    }
+                    if (values instanceof Stream) {
+                        try (Stream<?> stream = (Stream<?>) values) {
+                            List<?> collected = stream.toList();
+                            if (!collected.isEmpty()) {
+                                return collected.toArray();
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            return null;
+        }
+
+        private static UsageIndex scanJarUsage(Path clientJarPath) throws IOException {
+            UsageIndex index = new UsageIndex();
+            try (ZipFile zipFile = new ZipFile(clientJarPath.toFile())) {
+                Enumeration<? extends ZipEntry> entries = zipFile.entries();
+                while (entries.hasMoreElements()) {
+                    ZipEntry entry = entries.nextElement();
+                    if (entry.isDirectory()) {
+                        continue;
+                    }
+
+                    String entryName = entry.getName();
+                    RendererCategory category = RendererCategory.forClassEntry(entryName);
+                    if (category == RendererCategory.IGNORE || !entryName.endsWith(".class")) {
+                        continue;
+                    }
+
+                    InputStream in = zipFile.getInputStream(entry);
+                    try {
+                        scanClassReferences(in, category, index);
+                    } finally {
+                        in.close();
+                    }
+                }
+            }
+            return index;
+        }
+
+        private static void scanClassReferences(InputStream input, RendererCategory category, UsageIndex index) throws IOException {
+            DataInputStream in = new DataInputStream(input);
+            if (in.readInt() != 0xCAFEBABE) {
+                return;
+            }
+
+            in.readUnsignedShort();
+            in.readUnsignedShort();
+
+            int cpCount = in.readUnsignedShort();
+            int[] tags = new int[cpCount];
+            String[] utf8 = new String[cpCount];
+            int[] classNameIndex = new int[cpCount];
+            int[] memberClassIndex = new int[cpCount];
+            int[] memberNameAndTypeIndex = new int[cpCount];
+            int[] nameAndTypeNameIndex = new int[cpCount];
+
+            for (int i = 1; i < cpCount; i++) {
+                int tag = in.readUnsignedByte();
+                tags[i] = tag;
+                switch (tag) {
+                    case 1:
+                        utf8[i] = in.readUTF();
+                        break;
+                    case 3:
+                    case 4:
+                        in.readInt();
+                        break;
+                    case 5:
+                    case 6:
+                        in.readLong();
+                        i++;
+                        break;
+                    case 7:
+                    case 8:
+                    case 16:
+                    case 19:
+                    case 20:
+                        classNameIndex[i] = in.readUnsignedShort();
+                        break;
+                    case 9:
+                    case 10:
+                    case 11:
+                        memberClassIndex[i] = in.readUnsignedShort();
+                        memberNameAndTypeIndex[i] = in.readUnsignedShort();
+                        break;
+                    case 12:
+                        nameAndTypeNameIndex[i] = in.readUnsignedShort();
+                        in.readUnsignedShort();
+                        break;
+                    case 15:
+                        in.readUnsignedByte();
+                        in.readUnsignedShort();
+                        break;
+                    case 17:
+                    case 18:
+                        in.readUnsignedShort();
+                        in.readUnsignedShort();
+                        break;
+                    default:
+                        throw new IOException("Unsupported class file constant tag: " + tag);
+                }
+            }
+
+            for (int i = 1; i < cpCount; i++) {
+                int tag = tags[i];
+                if (tag != 9 && tag != 10) {
+                    continue;
+                }
+
+                String owner = resolveClassName(utf8, classNameIndex, memberClassIndex[i]);
+                String memberName = resolveUtf8(utf8, nameAndTypeNameIndex[memberNameAndTypeIndex[i]]);
+                if (owner == null || memberName == null) {
+                    continue;
+                }
+                if (!"net/minecraft/client/model/geom/ModelLayers".equals(owner)) {
+                    continue;
+                }
+
+                if (tag == 9) {
+                    index.recordField(memberName, category);
+                } else {
+                    index.recordFactory(memberName, category);
+                }
+            }
+        }
+
+        private static String resolveClassName(String[] utf8, int[] classNameIndex, int entryIndex) {
+            if (entryIndex <= 0 || entryIndex >= classNameIndex.length) {
+                return null;
+            }
+            int nameIndex = classNameIndex[entryIndex];
+            return resolveUtf8(utf8, nameIndex);
+        }
+
+        private static String resolveUtf8(String[] utf8, int index) {
+            if (index <= 0 || index >= utf8.length) {
+                return null;
+            }
+            return utf8[index];
+        }
+
+        private static final class UsageIndex {
+            final Map<String, Usage> fieldUsage = new HashMap<String, Usage>();
+            final Map<String, Usage> factoryUsage = new HashMap<String, Usage>();
+
+            void recordField(String name, RendererCategory category) {
+                record(this.fieldUsage, name, category);
+            }
+
+            void recordFactory(String name, RendererCategory category) {
+                record(this.factoryUsage, name, category);
+            }
+
+            private static void record(Map<String, Usage> map, String name, RendererCategory category) {
+                Usage usage = map.get(name);
+                if (usage == null) {
+                    usage = new Usage();
+                    map.put(name, usage);
+                }
+                usage.record(category);
+            }
+        }
+
+        private static final class Usage {
+            boolean entity;
+            boolean nonEntity;
+
+            void record(RendererCategory category) {
+                if (category == RendererCategory.ENTITY) {
+                    this.entity = true;
+                } else if (category == RendererCategory.NON_ENTITY) {
+                    this.nonEntity = true;
+                }
+            }
+
+            boolean shouldApply() {
+                return this.entity || !this.nonEntity;
+            }
+        }
+
+        private static enum RendererCategory {
+            ENTITY,
+            NON_ENTITY,
+            IGNORE;
+
+            static RendererCategory forClassEntry(String entryName) {
+                if (!entryName.startsWith("net/minecraft/client/renderer/")) {
+                    return IGNORE;
+                }
+                if (entryName.startsWith("net/minecraft/client/renderer/entity/")) {
+                    return ENTITY;
+                }
+                if (entryName.startsWith("net/minecraft/client/renderer/blockentity/")
+                        || entryName.startsWith("net/minecraft/client/renderer/special/")) {
+                    return NON_ENTITY;
+                }
+                return IGNORE;
+            }
+        }
+    }
+
     private static final class ReflectionContext {
+        final Class<?> modelLayerLocationClass;
+        final Class<?> modelLayersClass;
         final Class<?> poseClass;
         final Class<?> cubeClass;
         final Class<?> modelPartVisitorClass;
@@ -1359,6 +1724,7 @@ public final class EntityLayerObjExporter {
 
         ReflectionContext() throws Exception {
             Class<?> modelLayerLocationClass = Class.forName("net.minecraft.client.model.geom.ModelLayerLocation");
+            Class<?> modelLayersClass = Class.forName("net.minecraft.client.model.geom.ModelLayers");
             Class<?> entityModelSetClass = Class.forName("net.minecraft.client.model.geom.EntityModelSet");
             Class<?> layerDefinitionsClass = Class.forName("net.minecraft.client.model.geom.LayerDefinitions");
             Class<?> sharedConstantsClass = Class.forName("net.minecraft.SharedConstants");
@@ -1373,6 +1739,8 @@ public final class EntityLayerObjExporter {
             Class<?> polygonClass = Class.forName("net.minecraft.client.model.geom.ModelPart$Polygon");
             Class<?> vertexClass = Class.forName("net.minecraft.client.model.geom.ModelPart$Vertex");
 
+            this.modelLayerLocationClass = modelLayerLocationClass;
+            this.modelLayersClass = modelLayersClass;
             this.poseClass = poseClass;
             this.cubeClass = cubeClass;
             this.modelPartVisitorClass = Class.forName("net.minecraft.client.model.geom.ModelPart$Visitor");
