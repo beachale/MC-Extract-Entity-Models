@@ -26,6 +26,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
@@ -58,7 +59,7 @@ public final class EntityLayerObjExporter {
         TextureResolver textureResolver = null;
         try {
             if (config.clientJarPath != null) {
-                textureResolver = new TextureResolver(config.clientJarPath, config.outputDir);
+                textureResolver = new TextureResolver(ctx, config.clientJarPath, config.outputDir);
                 extractedTextures = textureResolver.extractAllTrackedTextures();
             }
 
@@ -559,6 +560,715 @@ public final class EntityLayerObjExporter {
         }
     }
 
+    private static final class RuntimeTextureIndex {
+        private final Map<String, Map<String, Integer>> candidateScoresByLocationKey;
+
+        private RuntimeTextureIndex(Map<String, Map<String, Integer>> candidateScoresByLocationKey) {
+            this.candidateScoresByLocationKey = candidateScoresByLocationKey;
+        }
+
+        static RuntimeTextureIndex create(ReflectionContext ctx, Path clientJarPath) throws Exception {
+            Map<String, Map<String, Integer>> candidateScoresByLocationKey = new HashMap<String, Map<String, Integer>>();
+            if (clientJarPath == null || !Files.exists(clientJarPath)) {
+                return new RuntimeTextureIndex(candidateScoresByLocationKey);
+            }
+
+            Map<String, String> fieldNameByLocationKey = RuntimeOrientationResolver.discoverStaticLocations(ctx);
+            Map<String, String> factoryNameByLocationKey = RuntimeOrientationResolver.discoverFactoryLocations(ctx);
+            Map<String, Set<String>> locationKeysByField = invertLocationMembers(fieldNameByLocationKey);
+            Map<String, Set<String>> locationKeysByFactory = invertLocationMembers(factoryNameByLocationKey);
+
+            try (ZipFile zipFile = new ZipFile(clientJarPath.toFile())) {
+                Enumeration<? extends ZipEntry> entries = zipFile.entries();
+                while (entries.hasMoreElements()) {
+                    ZipEntry entry = entries.nextElement();
+                    if (entry.isDirectory()) {
+                        continue;
+                    }
+
+                    String entryName = entry.getName();
+                    if (!isRendererTextureCandidate(entryName)) {
+                        continue;
+                    }
+
+                    try (InputStream in = zipFile.getInputStream(entry)) {
+                        ClassTextureUsage usage = scanClassTextureUsage(in, entryName);
+                        if (usage != null) {
+                            usage.recordCandidates(candidateScoresByLocationKey, locationKeysByField, locationKeysByFactory);
+                        }
+                    }
+                }
+            }
+
+            return new RuntimeTextureIndex(candidateScoresByLocationKey);
+        }
+
+        Map<String, Integer> findCandidates(LocationInfo info) {
+            Map<String, Integer> candidates = this.candidateScoresByLocationKey.get(locationKey(info));
+            return candidates != null ? candidates : new HashMap<String, Integer>();
+        }
+
+        private static String locationKey(LocationInfo info) {
+            return info.namespace + ":" + info.modelPath + "#" + info.layer;
+        }
+
+        private static Map<String, Set<String>> invertLocationMembers(Map<String, String> memberByLocationKey) {
+            Map<String, Set<String>> out = new HashMap<String, Set<String>>();
+            for (Map.Entry<String, String> entry : memberByLocationKey.entrySet()) {
+                String locationKey = entry.getKey();
+                String memberName = entry.getValue();
+                if (locationKey == null || memberName == null || memberName.isEmpty()) {
+                    continue;
+                }
+
+                Set<String> locations = out.get(memberName);
+                if (locations == null) {
+                    locations = new LinkedHashSet<String>();
+                    out.put(memberName, locations);
+                }
+                locations.add(locationKey);
+            }
+            return out;
+        }
+
+        private static boolean isRendererTextureCandidate(String entryName) {
+            if (!entryName.endsWith(".class")) {
+                return false;
+            }
+            if (!entryName.startsWith("net/minecraft/client/renderer/")) {
+                return false;
+            }
+            return entryName.startsWith("net/minecraft/client/renderer/entity/")
+                || entryName.startsWith("net/minecraft/client/renderer/blockentity/")
+                || entryName.startsWith("net/minecraft/client/renderer/special/");
+        }
+
+        private static ClassTextureUsage scanClassTextureUsage(InputStream input, String entryName) throws IOException {
+            DataInputStream in = new DataInputStream(input);
+            if (in.readInt() != 0xCAFEBABE) {
+                return null;
+            }
+
+            in.readUnsignedShort();
+            in.readUnsignedShort();
+
+            ConstantPoolData constantPool = ConstantPoolData.read(in);
+
+            in.readUnsignedShort();
+            int thisClassIndex = in.readUnsignedShort();
+            in.readUnsignedShort();
+            String className = constantPool.resolveClassName(thisClassIndex);
+            if (className == null || className.isEmpty()) {
+                className = entryName.substring(0, entryName.length() - ".class".length());
+            }
+
+            int interfaceCount = in.readUnsignedShort();
+            skipFully(in, interfaceCount * 2);
+
+            int fieldCount = in.readUnsignedShort();
+            for (int i = 0; i < fieldCount; i++) {
+                skipFieldInfo(in);
+            }
+
+            ClassTextureUsage usage = new ClassTextureUsage(className);
+            int methodCount = in.readUnsignedShort();
+            for (int i = 0; i < methodCount; i++) {
+                scanMethod(in, constantPool, usage);
+            }
+
+            skipAttributes(in);
+            return usage;
+        }
+
+        private static void scanMethod(DataInputStream in, ConstantPoolData constantPool, ClassTextureUsage usage) throws IOException {
+            in.readUnsignedShort();
+            String methodName = constantPool.resolveUtf8(in.readUnsignedShort());
+            in.readUnsignedShort();
+
+            byte[] code = null;
+            int attributeCount = in.readUnsignedShort();
+            for (int i = 0; i < attributeCount; i++) {
+                String attributeName = constantPool.resolveUtf8(in.readUnsignedShort());
+                int attributeLength = in.readInt();
+                if ("Code".equals(attributeName)) {
+                    in.readUnsignedShort();
+                    in.readUnsignedShort();
+                    int codeLength = in.readInt();
+                    code = new byte[codeLength];
+                    in.readFully(code);
+
+                    int exceptionTableLength = in.readUnsignedShort();
+                    skipFully(in, exceptionTableLength * 8);
+
+                    int codeAttributeCount = in.readUnsignedShort();
+                    for (int j = 0; j < codeAttributeCount; j++) {
+                        in.readUnsignedShort();
+                        int nestedAttributeLength = in.readInt();
+                        skipFully(in, nestedAttributeLength);
+                    }
+                } else {
+                    skipFully(in, attributeLength);
+                }
+            }
+
+            if (code != null) {
+                scanBytecode(code, methodName, constantPool, usage);
+            }
+        }
+
+        private static void scanBytecode(byte[] code, String methodName, ConstantPoolData constantPool, ClassTextureUsage usage) throws IOException {
+            boolean constructor = "<init>".equals(methodName);
+            boolean clinit = "<clinit>".equals(methodName);
+            boolean textureMethod = isTextureMethod(methodName);
+            boolean renderMethod = isRenderMethod(methodName);
+            String pendingTexture = null;
+
+            for (int pc = 0; pc < code.length; ) {
+                int opcode = code[pc] & 0xFF;
+                switch (opcode) {
+                    case 18: {
+                        String textureEntry = normalizeTextureEntry(constantPool.resolveString(code[pc + 1] & 0xFF));
+                        if (textureEntry != null) {
+                            pendingTexture = textureEntry;
+                            usage.recordDirectTexture(textureEntry, textureMethod, renderMethod);
+                        }
+                        pc += 2;
+                        continue;
+                    }
+                    case 19:
+                    case 20: {
+                        String textureEntry = normalizeTextureEntry(constantPool.resolveString(readUnsignedShort(code, pc + 1)));
+                        if (textureEntry != null) {
+                            pendingTexture = textureEntry;
+                            usage.recordDirectTexture(textureEntry, textureMethod, renderMethod);
+                        }
+                        pc += 3;
+                        continue;
+                    }
+                    case 178:
+                    case 179:
+                    case 180:
+                    case 181: {
+                        int memberIndex = readUnsignedShort(code, pc + 1);
+                        String owner = constantPool.resolveMemberOwner(memberIndex);
+                        String memberName = constantPool.resolveMemberName(memberIndex);
+                        if ("net/minecraft/client/model/geom/ModelLayers".equals(owner)) {
+                            usage.recordLayerField(memberName, constructor);
+                        } else if (usage.className.equals(owner) && memberName != null) {
+                            if (opcode == 179 && clinit && pendingTexture != null) {
+                                usage.texturePathByField.put(memberName, pendingTexture);
+                                pendingTexture = null;
+                            } else if (opcode == 178) {
+                                usage.recordTextureFieldUse(memberName, textureMethod, renderMethod);
+                            }
+                        }
+                        pc += 3;
+                        continue;
+                    }
+                    case 182:
+                    case 183:
+                    case 184: {
+                        int memberIndex = readUnsignedShort(code, pc + 1);
+                        String owner = constantPool.resolveMemberOwner(memberIndex);
+                        String memberName = constantPool.resolveMemberName(memberIndex);
+                        if ("net/minecraft/client/model/geom/ModelLayers".equals(owner)) {
+                            usage.recordLayerFactory(memberName, constructor);
+                        }
+                        pc += 3;
+                        continue;
+                    }
+                    case 185:
+                    case 186:
+                        pc += 5;
+                        continue;
+                    default:
+                        pc += instructionLength(code, pc, opcode);
+                        continue;
+                }
+            }
+        }
+
+        private static boolean isTextureMethod(String methodName) {
+            if (methodName == null) {
+                return false;
+            }
+            String lower = methodName.toLowerCase(Locale.ROOT);
+            return lower.contains("texture") || lower.contains("skin");
+        }
+
+        private static boolean isRenderMethod(String methodName) {
+            if (methodName == null) {
+                return false;
+            }
+            String lower = methodName.toLowerCase(Locale.ROOT);
+            return lower.contains("render") || lower.contains("submit");
+        }
+
+        private static String normalizeTextureEntry(String value) {
+            if (value == null) {
+                return null;
+            }
+
+            String normalized = value.trim().replace('\\', '/');
+            if (!normalized.endsWith(".png")) {
+                return null;
+            }
+            if (normalized.startsWith("/")) {
+                normalized = normalized.substring(1);
+            }
+            if (normalized.startsWith("assets/")) {
+                return normalized;
+            }
+
+            int colon = normalized.indexOf(':');
+            if (colon > 0) {
+                String namespace = normalized.substring(0, colon);
+                String path = normalized.substring(colon + 1);
+                if (path.startsWith("/")) {
+                    path = path.substring(1);
+                }
+                return "assets/" + namespace + "/" + path;
+            }
+
+            if (normalized.startsWith("textures/")) {
+                return "assets/minecraft/" + normalized;
+            }
+
+            return null;
+        }
+
+        private static int instructionLength(byte[] code, int pc, int opcode) throws IOException {
+            switch (opcode) {
+                case 16:
+                case 18:
+                case 21:
+                case 22:
+                case 23:
+                case 24:
+                case 25:
+                case 54:
+                case 55:
+                case 56:
+                case 57:
+                case 58:
+                case 169:
+                case 188:
+                    return 2;
+                case 17:
+                case 19:
+                case 20:
+                case 132:
+                case 153:
+                case 154:
+                case 155:
+                case 156:
+                case 157:
+                case 158:
+                case 159:
+                case 160:
+                case 161:
+                case 162:
+                case 163:
+                case 164:
+                case 165:
+                case 166:
+                case 167:
+                case 168:
+                case 178:
+                case 179:
+                case 180:
+                case 181:
+                case 182:
+                case 183:
+                case 184:
+                case 187:
+                case 189:
+                case 192:
+                case 193:
+                case 198:
+                case 199:
+                    return 3;
+                case 185:
+                case 186:
+                case 197:
+                case 200:
+                case 201:
+                    return opcode == 197 ? 4 : 5;
+                case 170: {
+                    int aligned = (pc + 4) & ~3;
+                    int low = readInt(code, aligned + 4);
+                    int high = readInt(code, aligned + 8);
+                    return (aligned - pc) + 12 + ((high - low + 1) * 4);
+                }
+                case 171: {
+                    int aligned = (pc + 4) & ~3;
+                    int pairs = readInt(code, aligned + 4);
+                    return (aligned - pc) + 8 + (pairs * 8);
+                }
+                case 196: {
+                    int widenedOpcode = code[pc + 1] & 0xFF;
+                    return widenedOpcode == 132 ? 6 : 4;
+                }
+                default:
+                    return 1;
+            }
+        }
+
+        private static int readUnsignedShort(byte[] code, int offset) {
+            return ((code[offset] & 0xFF) << 8) | (code[offset + 1] & 0xFF);
+        }
+
+        private static int readInt(byte[] code, int offset) {
+            return ((code[offset] & 0xFF) << 24)
+                | ((code[offset + 1] & 0xFF) << 16)
+                | ((code[offset + 2] & 0xFF) << 8)
+                | (code[offset + 3] & 0xFF);
+        }
+
+        private static void skipFieldInfo(DataInputStream in) throws IOException {
+            in.readUnsignedShort();
+            in.readUnsignedShort();
+            in.readUnsignedShort();
+            skipAttributes(in);
+        }
+
+        private static void skipAttributes(DataInputStream in) throws IOException {
+            int attributeCount = in.readUnsignedShort();
+            for (int i = 0; i < attributeCount; i++) {
+                in.readUnsignedShort();
+                int attributeLength = in.readInt();
+                skipFully(in, attributeLength);
+            }
+        }
+
+        private static void skipFully(DataInputStream in, int length) throws IOException {
+            int remaining = length;
+            while (remaining > 0) {
+                int skipped = in.skipBytes(remaining);
+                if (skipped <= 0) {
+                    in.readByte();
+                    skipped = 1;
+                }
+                remaining -= skipped;
+            }
+        }
+
+        private static final class ConstantPoolData {
+            final int[] tags;
+            final String[] utf8;
+            final int[] classNameIndex;
+            final int[] stringIndex;
+            final int[] memberClassIndex;
+            final int[] memberNameAndTypeIndex;
+            final int[] nameAndTypeNameIndex;
+
+            ConstantPoolData(
+                int[] tags,
+                String[] utf8,
+                int[] classNameIndex,
+                int[] stringIndex,
+                int[] memberClassIndex,
+                int[] memberNameAndTypeIndex,
+                int[] nameAndTypeNameIndex
+            ) {
+                this.tags = tags;
+                this.utf8 = utf8;
+                this.classNameIndex = classNameIndex;
+                this.stringIndex = stringIndex;
+                this.memberClassIndex = memberClassIndex;
+                this.memberNameAndTypeIndex = memberNameAndTypeIndex;
+                this.nameAndTypeNameIndex = nameAndTypeNameIndex;
+            }
+
+            static ConstantPoolData read(DataInputStream in) throws IOException {
+                int cpCount = in.readUnsignedShort();
+                int[] tags = new int[cpCount];
+                String[] utf8 = new String[cpCount];
+                int[] classNameIndex = new int[cpCount];
+                int[] stringIndex = new int[cpCount];
+                int[] memberClassIndex = new int[cpCount];
+                int[] memberNameAndTypeIndex = new int[cpCount];
+                int[] nameAndTypeNameIndex = new int[cpCount];
+
+                for (int i = 1; i < cpCount; i++) {
+                    int tag = in.readUnsignedByte();
+                    tags[i] = tag;
+                    switch (tag) {
+                        case 1:
+                            utf8[i] = in.readUTF();
+                            break;
+                        case 3:
+                        case 4:
+                            in.readInt();
+                            break;
+                        case 5:
+                        case 6:
+                            in.readLong();
+                            i++;
+                            break;
+                        case 7:
+                            classNameIndex[i] = in.readUnsignedShort();
+                            break;
+                        case 8:
+                            stringIndex[i] = in.readUnsignedShort();
+                            break;
+                        case 9:
+                        case 10:
+                        case 11:
+                            memberClassIndex[i] = in.readUnsignedShort();
+                            memberNameAndTypeIndex[i] = in.readUnsignedShort();
+                            break;
+                        case 12:
+                            nameAndTypeNameIndex[i] = in.readUnsignedShort();
+                            in.readUnsignedShort();
+                            break;
+                        case 15:
+                            in.readUnsignedByte();
+                            in.readUnsignedShort();
+                            break;
+                        case 16:
+                        case 19:
+                        case 20:
+                            in.readUnsignedShort();
+                            break;
+                        case 17:
+                        case 18:
+                            in.readUnsignedShort();
+                            in.readUnsignedShort();
+                            break;
+                        default:
+                            throw new IOException("Unsupported class file constant tag: " + tag);
+                    }
+                }
+
+                return new ConstantPoolData(tags, utf8, classNameIndex, stringIndex, memberClassIndex, memberNameAndTypeIndex, nameAndTypeNameIndex);
+            }
+
+            String resolveUtf8(int index) {
+                if (index <= 0 || index >= this.utf8.length) {
+                    return null;
+                }
+                return this.utf8[index];
+            }
+
+            String resolveClassName(int index) {
+                if (index <= 0 || index >= this.classNameIndex.length) {
+                    return null;
+                }
+                return resolveUtf8(this.classNameIndex[index]);
+            }
+
+            String resolveMemberOwner(int index) {
+                if (index <= 0 || index >= this.memberClassIndex.length) {
+                    return null;
+                }
+                return resolveClassName(this.memberClassIndex[index]);
+            }
+
+            String resolveMemberName(int index) {
+                if (index <= 0 || index >= this.memberNameAndTypeIndex.length) {
+                    return null;
+                }
+                int nameAndTypeIndex = this.memberNameAndTypeIndex[index];
+                if (nameAndTypeIndex <= 0 || nameAndTypeIndex >= this.nameAndTypeNameIndex.length) {
+                    return null;
+                }
+                return resolveUtf8(this.nameAndTypeNameIndex[nameAndTypeIndex]);
+            }
+
+            String resolveString(int index) {
+                if (index <= 0 || index >= this.tags.length) {
+                    return null;
+                }
+                if (this.tags[index] == 8) {
+                    return resolveUtf8(this.stringIndex[index]);
+                }
+                if (this.tags[index] == 1) {
+                    return this.utf8[index];
+                }
+                return null;
+            }
+        }
+
+        private static final class ClassTextureUsage {
+            final String className;
+            final Set<String> constructorLayerFields;
+            final Set<String> constructorLayerFactories;
+            final Set<String> methodLayerFields;
+            final Set<String> methodLayerFactories;
+            final Map<String, String> texturePathByField;
+            final Set<String> textureFieldsInTextureMethods;
+            final Set<String> textureFieldsInRenderMethods;
+            final Set<String> directTexturesInTextureMethods;
+            final Set<String> directTexturesInRenderMethods;
+
+            ClassTextureUsage(String className) {
+                this.className = className;
+                this.constructorLayerFields = new LinkedHashSet<String>();
+                this.constructorLayerFactories = new LinkedHashSet<String>();
+                this.methodLayerFields = new LinkedHashSet<String>();
+                this.methodLayerFactories = new LinkedHashSet<String>();
+                this.texturePathByField = new HashMap<String, String>();
+                this.textureFieldsInTextureMethods = new LinkedHashSet<String>();
+                this.textureFieldsInRenderMethods = new LinkedHashSet<String>();
+                this.directTexturesInTextureMethods = new LinkedHashSet<String>();
+                this.directTexturesInRenderMethods = new LinkedHashSet<String>();
+            }
+
+            void recordLayerField(String memberName, boolean constructor) {
+                if (memberName == null || memberName.isEmpty()) {
+                    return;
+                }
+                if (constructor) {
+                    this.constructorLayerFields.add(memberName);
+                } else {
+                    this.methodLayerFields.add(memberName);
+                }
+            }
+
+            void recordLayerFactory(String memberName, boolean constructor) {
+                if (memberName == null || memberName.isEmpty()) {
+                    return;
+                }
+                if (constructor) {
+                    this.constructorLayerFactories.add(memberName);
+                } else {
+                    this.methodLayerFactories.add(memberName);
+                }
+            }
+
+            void recordTextureFieldUse(String fieldName, boolean textureMethod, boolean renderMethod) {
+                if (fieldName == null || fieldName.isEmpty()) {
+                    return;
+                }
+                if (textureMethod) {
+                    this.textureFieldsInTextureMethods.add(fieldName);
+                }
+                if (renderMethod) {
+                    this.textureFieldsInRenderMethods.add(fieldName);
+                }
+            }
+
+            void recordDirectTexture(String textureEntry, boolean textureMethod, boolean renderMethod) {
+                if (textureEntry == null || textureEntry.isEmpty()) {
+                    return;
+                }
+                if (textureMethod) {
+                    this.directTexturesInTextureMethods.add(textureEntry);
+                }
+                if (renderMethod) {
+                    this.directTexturesInRenderMethods.add(textureEntry);
+                }
+            }
+
+            void recordCandidates(
+                Map<String, Map<String, Integer>> candidateScoresByLocationKey,
+                Map<String, Set<String>> locationKeysByField,
+                Map<String, Set<String>> locationKeysByFactory
+            ) {
+                Map<String, Integer> locationScores = collectLocationScores(locationKeysByField, locationKeysByFactory);
+                if (locationScores.isEmpty()) {
+                    return;
+                }
+
+                Map<String, Integer> textureScores = collectTextureScores();
+                if (textureScores.isEmpty()) {
+                    return;
+                }
+
+                for (Map.Entry<String, Integer> locationEntry : locationScores.entrySet()) {
+                    String locationKey = locationEntry.getKey();
+                    int locationScore = locationEntry.getValue().intValue();
+
+                    Map<String, Integer> textureScoresForLocation = candidateScoresByLocationKey.get(locationKey);
+                    if (textureScoresForLocation == null) {
+                        textureScoresForLocation = new HashMap<String, Integer>();
+                        candidateScoresByLocationKey.put(locationKey, textureScoresForLocation);
+                    }
+
+                    for (Map.Entry<String, Integer> textureEntry : textureScores.entrySet()) {
+                        int combinedScore = locationScore + textureEntry.getValue().intValue();
+                        Integer previous = textureScoresForLocation.get(textureEntry.getKey());
+                        if (previous == null || combinedScore > previous.intValue()) {
+                            textureScoresForLocation.put(textureEntry.getKey(), Integer.valueOf(combinedScore));
+                        }
+                    }
+                }
+            }
+
+            private Map<String, Integer> collectLocationScores(
+                Map<String, Set<String>> locationKeysByField,
+                Map<String, Set<String>> locationKeysByFactory
+            ) {
+                Map<String, Integer> out = new HashMap<String, Integer>();
+                addLocationScores(out, this.constructorLayerFields, locationKeysByField, 240, false);
+                addLocationScores(out, this.constructorLayerFactories, locationKeysByFactory, 200, true);
+                addLocationScores(out, this.methodLayerFields, locationKeysByField, 90, false);
+                addLocationScores(out, this.methodLayerFactories, locationKeysByFactory, 60, true);
+                return out;
+            }
+
+            private Map<String, Integer> collectTextureScores() {
+                Map<String, Integer> out = new HashMap<String, Integer>();
+                addResolvedTextureScores(out, this.textureFieldsInTextureMethods, 420);
+                addDirectTextureScores(out, this.directTexturesInTextureMethods, 400);
+                addResolvedTextureScores(out, this.textureFieldsInRenderMethods, 320);
+                addDirectTextureScores(out, this.directTexturesInRenderMethods, 300);
+
+                if (out.isEmpty() && this.texturePathByField.size() == 1) {
+                    for (String texture : this.texturePathByField.values()) {
+                        out.put(texture, Integer.valueOf(220));
+                    }
+                }
+
+                return out;
+            }
+
+            private void addResolvedTextureScores(Map<String, Integer> out, Set<String> fieldNames, int score) {
+                for (String fieldName : fieldNames) {
+                    String textureEntry = this.texturePathByField.get(fieldName);
+                    if (textureEntry != null) {
+                        mergeScore(out, textureEntry, score);
+                    }
+                }
+            }
+
+            private void addDirectTextureScores(Map<String, Integer> out, Set<String> textureEntries, int score) {
+                for (String textureEntry : textureEntries) {
+                    mergeScore(out, textureEntry, score);
+                }
+            }
+
+            private static void addLocationScores(
+                Map<String, Integer> out,
+                Set<String> memberNames,
+                Map<String, Set<String>> locationKeysByMember,
+                int score,
+                boolean requireUniqueLocation
+            ) {
+                for (String memberName : memberNames) {
+                    Set<String> locationKeys = locationKeysByMember.get(memberName);
+                    if (locationKeys == null || locationKeys.isEmpty()) {
+                        continue;
+                    }
+                    if (requireUniqueLocation && locationKeys.size() != 1) {
+                        continue;
+                    }
+                    for (String locationKey : locationKeys) {
+                        mergeScore(out, locationKey, score);
+                    }
+                }
+            }
+
+            private static void mergeScore(Map<String, Integer> out, String key, int score) {
+                Integer previous = out.get(key);
+                if (previous == null || score > previous.intValue()) {
+                    out.put(key, Integer.valueOf(score));
+                }
+            }
+        }
+    }
+
     private static final class TextureResolver implements AutoCloseable {
         private static final String[] STRIP_SUFFIXES = new String[] {
             "_baby",
@@ -608,13 +1318,15 @@ public final class EntityLayerObjExporter {
         private final List<String> textureEntries;
         private final Map<String, ResolvedTexture> cache;
         private final Set<String> extracted;
+        private final RuntimeTextureIndex runtimeTextureIndex;
 
-        TextureResolver(Path clientJar, Path outputDir) throws IOException {
+        TextureResolver(ReflectionContext ctx, Path clientJar, Path outputDir) throws Exception {
             this.zipFile = new ZipFile(clientJar.toFile());
             this.outputDir = outputDir;
             this.textureEntries = new ArrayList<String>();
             this.cache = new HashMap<String, ResolvedTexture>();
             this.extracted = new HashSet<String>();
+            this.runtimeTextureIndex = RuntimeTextureIndex.create(ctx, clientJar);
 
             Enumeration<? extends ZipEntry> enumeration = this.zipFile.entries();
             while (enumeration.hasMoreElements()) {
@@ -674,81 +1386,28 @@ public final class EntityLayerObjExporter {
         }
 
         private ResolvedTexture resolve(LocationInfo info) {
-            String namespaceLower = info.namespace.toLowerCase(Locale.ROOT);
-            String modelPathLower = info.modelPath.toLowerCase(Locale.ROOT);
-            String layerLower = info.layer.toLowerCase(Locale.ROOT);
+            TextureSearchContext search = TextureSearchContext.create(this, info);
 
-            String knownEntry = findKnownTextureEntry(namespaceLower, modelPathLower, layerLower);
+            String runtimeEntry = findRuntimeTextureEntry(info, search);
+            if (runtimeEntry != null) {
+                return resolvedFromEntry(runtimeEntry);
+            }
+
+            String knownEntry = findKnownTextureEntry(search.namespaceLower, search.modelPathLower, search.layerLower);
             if (knownEntry != null) {
                 return resolvedFromEntry(knownEntry);
             }
-
-            String flatModel = modelPathLower.replace('/', '_');
-            String lastSegment = modelPathLower;
-            int slash = lastSegment.lastIndexOf('/');
-            if (slash >= 0) {
-                lastSegment = lastSegment.substring(slash + 1);
-            }
-
-            String canonicalFlat = stripSuffixes(flatModel);
-            String canonicalLast = stripSuffixes(lastSegment);
-            String compactFlat = flatModel.replace("_", "");
-            String compactLast = lastSegment.replace("_", "");
-            String compactCanonicalFlat = canonicalFlat.replace("_", "");
-            String compactCanonicalLast = canonicalLast.replace("_", "");
-            boolean hasCanonicalFileNameCandidates = hasNamespaceEntryWithFileNameToken(namespaceLower, canonicalLast);
-
-            LinkedHashSet<String> names = new LinkedHashSet<String>();
-            addName(names, flatModel);
-            addName(names, lastSegment);
-            addName(names, canonicalFlat);
-            addName(names, canonicalLast);
-            addName(names, compactFlat);
-            addName(names, compactLast);
-            addName(names, compactCanonicalFlat);
-            addName(names, compactCanonicalLast);
-
-            if (!"main".equals(layerLower)) {
-                addName(names, flatModel + "_" + layerLower);
-                addName(names, lastSegment + "_" + layerLower);
-                addName(names, canonicalFlat + "_" + layerLower);
-                addName(names, canonicalLast + "_" + layerLower);
-                addName(names, compactFlat + "_" + layerLower);
-                addName(names, compactLast + "_" + layerLower);
-                addName(names, compactCanonicalFlat + "_" + layerLower);
-                addName(names, compactCanonicalLast + "_" + layerLower);
-            }
-
-            Set<String> modelTokens = tokenize(flatModel);
-            modelTokens.addAll(tokenize(lastSegment));
-            if (!canonicalFlat.equals(flatModel)) {
-                modelTokens.addAll(tokenize(canonicalFlat));
-            }
-
-            Set<String> layerTokens = tokenize(layerLower);
 
             int bestScore = Integer.MIN_VALUE;
             String bestEntry = null;
 
             for (String entry : this.textureEntries) {
                 String lower = entry.toLowerCase(Locale.ROOT);
-                if (!lower.startsWith("assets/" + namespaceLower + "/")) {
+                if (!lower.startsWith("assets/" + search.namespaceLower + "/")) {
                     continue;
                 }
 
-                int score = scoreEntry(
-                    lower,
-                    modelPathLower,
-                    layerLower,
-                    names,
-                    modelTokens,
-                    layerTokens,
-                    flatModel,
-                    canonicalFlat,
-                    lastSegment,
-                    canonicalLast,
-                    hasCanonicalFileNameCandidates
-                );
+                int score = search.score(lower);
 
                 if (score > bestScore) {
                     bestScore = score;
@@ -761,6 +1420,31 @@ public final class EntityLayerObjExporter {
             }
 
             return resolvedFromEntry(bestEntry);
+        }
+
+        private String findRuntimeTextureEntry(LocationInfo info, TextureSearchContext search) {
+            Map<String, Integer> candidates = this.runtimeTextureIndex.findCandidates(info);
+            if (candidates.isEmpty()) {
+                return null;
+            }
+
+            int bestScore = Integer.MIN_VALUE;
+            String bestEntry = null;
+
+            for (Map.Entry<String, Integer> candidate : candidates.entrySet()) {
+                String entry = candidate.getKey();
+                if (!hasTextureEntry(entry)) {
+                    continue;
+                }
+
+                int score = candidate.getValue().intValue() + search.score(entry.toLowerCase(Locale.ROOT));
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestEntry = entry;
+                }
+            }
+
+            return bestEntry;
         }
 
         private ResolvedTexture resolvedFromEntry(String entry) {
@@ -1082,6 +1766,126 @@ public final class EntityLayerObjExporter {
             }
             return false;
         }
+
+        private static final class TextureSearchContext {
+            final String namespaceLower;
+            final String modelPathLower;
+            final String layerLower;
+            final String flatModel;
+            final String canonicalFlat;
+            final String lastSegment;
+            final String canonicalLast;
+            final boolean hasCanonicalFileNameCandidates;
+            final Set<String> names;
+            final Set<String> modelTokens;
+            final Set<String> layerTokens;
+
+            private TextureSearchContext(
+                String namespaceLower,
+                String modelPathLower,
+                String layerLower,
+                String flatModel,
+                String canonicalFlat,
+                String lastSegment,
+                String canonicalLast,
+                boolean hasCanonicalFileNameCandidates,
+                Set<String> names,
+                Set<String> modelTokens,
+                Set<String> layerTokens
+            ) {
+                this.namespaceLower = namespaceLower;
+                this.modelPathLower = modelPathLower;
+                this.layerLower = layerLower;
+                this.flatModel = flatModel;
+                this.canonicalFlat = canonicalFlat;
+                this.lastSegment = lastSegment;
+                this.canonicalLast = canonicalLast;
+                this.hasCanonicalFileNameCandidates = hasCanonicalFileNameCandidates;
+                this.names = names;
+                this.modelTokens = modelTokens;
+                this.layerTokens = layerTokens;
+            }
+
+            static TextureSearchContext create(TextureResolver resolver, LocationInfo info) {
+                String namespaceLower = info.namespace.toLowerCase(Locale.ROOT);
+                String modelPathLower = info.modelPath.toLowerCase(Locale.ROOT);
+                String layerLower = info.layer.toLowerCase(Locale.ROOT);
+
+                String flatModel = modelPathLower.replace('/', '_');
+                String lastSegment = modelPathLower;
+                int slash = lastSegment.lastIndexOf('/');
+                if (slash >= 0) {
+                    lastSegment = lastSegment.substring(slash + 1);
+                }
+
+                String canonicalFlat = stripSuffixes(flatModel);
+                String canonicalLast = stripSuffixes(lastSegment);
+                String compactFlat = flatModel.replace("_", "");
+                String compactLast = lastSegment.replace("_", "");
+                String compactCanonicalFlat = canonicalFlat.replace("_", "");
+                String compactCanonicalLast = canonicalLast.replace("_", "");
+                boolean hasCanonicalFileNameCandidates = resolver.hasNamespaceEntryWithFileNameToken(namespaceLower, canonicalLast);
+
+                LinkedHashSet<String> names = new LinkedHashSet<String>();
+                addName(names, flatModel);
+                addName(names, lastSegment);
+                addName(names, canonicalFlat);
+                addName(names, canonicalLast);
+                addName(names, compactFlat);
+                addName(names, compactLast);
+                addName(names, compactCanonicalFlat);
+                addName(names, compactCanonicalLast);
+
+                if (!"main".equals(layerLower)) {
+                    addName(names, flatModel + "_" + layerLower);
+                    addName(names, lastSegment + "_" + layerLower);
+                    addName(names, canonicalFlat + "_" + layerLower);
+                    addName(names, canonicalLast + "_" + layerLower);
+                    addName(names, compactFlat + "_" + layerLower);
+                    addName(names, compactLast + "_" + layerLower);
+                    addName(names, compactCanonicalFlat + "_" + layerLower);
+                    addName(names, compactCanonicalLast + "_" + layerLower);
+                }
+
+                Set<String> modelTokens = tokenize(flatModel);
+                modelTokens.addAll(tokenize(lastSegment));
+                if (!canonicalFlat.equals(flatModel)) {
+                    modelTokens.addAll(tokenize(canonicalFlat));
+                }
+
+                Set<String> layerTokens = tokenize(layerLower);
+                return new TextureSearchContext(
+                    namespaceLower,
+                    modelPathLower,
+                    layerLower,
+                    flatModel,
+                    canonicalFlat,
+                    lastSegment,
+                    canonicalLast,
+                    hasCanonicalFileNameCandidates,
+                    names,
+                    modelTokens,
+                    layerTokens
+                );
+            }
+
+            int score(String lowerEntry) {
+                return scoreEntry(
+                    lowerEntry,
+                    this.modelPathLower,
+                    this.layerLower,
+                    this.names,
+                    this.modelTokens,
+                    this.layerTokens,
+                    this.flatModel,
+                    this.canonicalFlat,
+                    this.lastSegment,
+                    this.canonicalLast,
+                    this.hasCanonicalFileNameCandidates
+                );
+            }
+        }
+
         private static int scoreEntry(
             String entry,
             String modelPathLower,
@@ -1468,7 +2272,7 @@ public final class EntityLayerObjExporter {
                     }
                     if (values instanceof Stream) {
                         try (Stream<?> stream = (Stream<?>) values) {
-                            List<?> collected = stream.toList();
+                            List<?> collected = stream.collect(Collectors.toList());
                             if (!collected.isEmpty()) {
                                 return collected.toArray();
                             }
